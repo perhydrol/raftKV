@@ -23,51 +23,59 @@ type Coordinator struct {
 	wgMap            sync.WaitGroup
 	wgReduce         sync.WaitGroup
 	nReduce          int
-	mu               sync.RWMutex
 	mapTasksCount    int32
 	reduceTasksCount int32
-	maxWorkerId      int
-	running          map[string]runningTask
-	jobComplete      bool
+	maxWorkerId      int32
+	running          sync.Map
+	jobComplete      int32
+	closeChan        chan interface{}
 }
 
 func (c *Coordinator) timeout() {
-	for range time.Tick(1 * time.Second) {
-		c.mu.Lock()
-	OuterLoop:
-		for _, task := range c.running {
-			if time.Since(task.starTime) >= 10*time.Second {
-				log.Printf("[Warning] Master: timeout: task %s timed out.", task.Input)
-				newTask := taskInfo{
-					Task:        task.Task,
-					Input:       task.Input,
-					ReduceCount: task.ReduceCount,
-					WorkerId:    c.maxWorkerId,
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			c.running.Range(func(key, value any) bool {
+				k, ok := key.(int)
+				if !ok {
+					log.Panicf("[Error] Master: timeout: key cannot be resolved. key: %v", key)
+					return true
 				}
-				c.maxWorkerId++
-				for {
-					select {
-					case c.tasks <- newTask:
-						continue OuterLoop
-					default:
-						log.Printf("[Info] Master: timeout: task queue full, sleeping 2s.")
-						c.mu.Unlock()
-						time.Sleep(2 * time.Second)
-						c.mu.Lock()
+
+				if value == nil {
+					return true
+				}
+				// 使用类型断言前先获取值的副本，避免并发修改
+				v, ok := value.(runningTask)
+				if !ok {
+					log.Panicf("[Error] Master: timeout: value cannot be resolved. value: %v", value)
+					return true
+				}
+
+				if time.Since(v.starTime) >= 10*time.Second {
+					log.Printf("[Info] Master: timeout: worker id %d is timed out, retrying...", k)
+					newTask := taskInfo{
+						Task:        v.Task,
+						Input:       v.Input,
+						ReduceCount: v.ReduceCount,
+						WorkerId:    int(atomic.LoadInt32(&c.maxWorkerId)),
 					}
+					atomic.AddInt32(&c.maxWorkerId, 1)
+					c.tasks <- newTask
 				}
-			}
+				return true
+			})
+		case <-c.closeChan:
+			return
 		}
-		c.mu.Unlock()
 	}
 }
 
 func (c *Coordinator) allMapDone() {
 	c.wgMap.Wait()
 	log.Print("[Info] Master: allMapDone: all map tasks finished.")
-	c.mu.Lock()
-	defer c.mu.Unlock()
-OuterLoop:
 	for i := 0; i < c.nReduce; i++ {
 		log.Printf("[Info] Master: allMapDone: creating reduce task %d.", i)
 		idString := fmt.Sprintf("%d", i)
@@ -75,21 +83,11 @@ OuterLoop:
 			Task:        taskReduce,
 			Input:       idString,
 			ReduceCount: c.nReduce,
-			WorkerId:    c.maxWorkerId,
+			WorkerId:    int(atomic.LoadInt32(&c.maxWorkerId)),
 		}
-		c.maxWorkerId++
-		for {
-			select {
-			case c.tasks <- newTask:
-				continue OuterLoop
-			default:
-				log.Print("[Info] Master: allMapDone: task queue full, sleeping 2s.")
-				c.mu.Unlock()
-				time.Sleep(2 * time.Second)
-				log.Print("[Info] Master: allMapDone: retrying to assign reduce task.")
-				c.mu.Lock()
-			}
-		}
+		atomic.AddInt32(&c.maxWorkerId, 1)
+		c.tasks <- newTask
+
 	}
 	log.Print("[Info] Master: allMapDone: all reduce tasks created.")
 }
@@ -105,8 +103,6 @@ func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
 }
 
 func (c *Coordinator) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	select {
 	case task := <-c.tasks:
 		log.Printf("[Info] Master: GetTask: assigned task %s.", task.Input)
@@ -114,11 +110,11 @@ func (c *Coordinator) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
 		reply.ReduceCount = task.ReduceCount
 		reply.Task = task.Task
 		reply.WorkerId = task.WorkerId
-		if t, ok := c.running[task.Input]; ok {
-			msg := fmt.Errorf("duplicate task assignment: %s", t.Input)
+		newRunning := runningTask{taskInfo: task, starTime: time.Now()}
+		if t, ok := c.running.LoadOrStore(task.WorkerId, newRunning); ok {
+			msg := fmt.Errorf("duplicate task assignment: %s", t.(runningTask).Input)
 			log.Panicf("[Error] Master: GetTask: %v", msg)
 		}
-		c.running[task.Input] = runningTask{taskInfo: task, starTime: time.Now()}
 	case <-time.After(3 * time.Second):
 		log.Print("[Info] Master: GetTask: no task available.")
 		reply.Task = taskWait
@@ -147,9 +143,7 @@ func (c *Coordinator) ReturnTask(args *ReturnTaskArgs, reply *ReturnTaskReply) e
 		log.Printf("[Warning] Master: ReturnTask: %v", msg)
 		return msg
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	delete(c.running, args.Input)
+	c.running.Delete(args.WorkerId)
 	return nil
 }
 
@@ -171,9 +165,7 @@ func (c *Coordinator) server() {
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
 	// Your code here.
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.jobComplete
+	return atomic.LoadInt32(&c.jobComplete) > 0
 }
 
 // create a Coordinator.
@@ -186,12 +178,12 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		wgMap:            sync.WaitGroup{},
 		wgReduce:         sync.WaitGroup{},
 		nReduce:          nReduce,
-		mu:               sync.RWMutex{},
 		mapTasksCount:    int32(len(files)),
 		reduceTasksCount: int32(nReduce),
 		maxWorkerId:      0,
-		running:          make(map[string]runningTask),
-		jobComplete:      false,
+		running:          sync.Map{},
+		jobComplete:      0,
+		closeChan:        make(chan interface{}),
 	}
 
 	c.wgMap.Add(len(files))
@@ -200,9 +192,9 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 			Task:        taskMap,
 			Input:       input,
 			ReduceCount: nReduce,
-			WorkerId:    c.maxWorkerId,
+			WorkerId:    int(atomic.LoadInt32(&c.maxWorkerId)),
 		}
-		c.maxWorkerId++
+		atomic.AddInt32(&c.maxWorkerId, 1)
 		c.tasks <- newTask
 	}
 	c.wgReduce.Add(nReduce)
@@ -210,9 +202,9 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	// Your code here.
 	go func() {
 		c.wgReduce.Wait()
-		c.mu.Lock()
-		c.jobComplete = true
-		c.mu.Unlock()
+		log.Print("[Info] Master: Job has done!")
+		close(c.closeChan)
+		atomic.AddInt32(&c.jobComplete, 1)
 	}()
 	go c.timeout()
 	go c.allMapDone()
