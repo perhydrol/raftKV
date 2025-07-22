@@ -38,21 +38,24 @@ type GetTaskArgs struct {
 }
 
 type GetTaskReply struct {
-	taskInfo
+	Task        taskType
+	Input       string
+	ReduceCount int
+	WorkerId    int
 }
 
 type taskInfo struct {
 	Task        taskType
 	Input       string
 	ReduceCount int
-	workerId    int
+	WorkerId    int
 }
 
 type ReturnTaskArgs struct {
 	Task     taskType
 	Input    string
 	Output   []string
-	workerId int
+	WorkerId int
 }
 
 type ReturnTaskReply struct {

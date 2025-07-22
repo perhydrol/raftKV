@@ -49,24 +49,27 @@ func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 	// Your worker implementation here.
 	for {
+		log.Print("[Info] Worker: Worker: Get a new task")
 		task := GetTask()
 		switch task.Task {
 		case taskMap:
-			output := RunMap(mapf, task.Input)
-			ReturnTask(task.Input, output)
-			id = task.workerId
+			log.Printf("[Info] Worker: Worker: get a map task, reduceCount: %d", task.ReduceCount)
+			id = task.WorkerId
 			reduceCount = task.ReduceCount
 			phase = taskMap
-		case taskReduce:
-			output := RunReduce(reducef, task.Input)
+			output := RunMap(mapf, task.Input)
 			ReturnTask(task.Input, output)
-			id = task.workerId
+		case taskReduce:
+			log.Printf("[Info] Worker: Worker: get a reduce task, reduceCount: %d", task.ReduceCount)
+			id = task.WorkerId
 			reduceCount = task.ReduceCount
 			phase = taskReduce
+			output := RunReduce(reducef, task.Input)
+			ReturnTask(task.Input, output)
 		case taskWait:
 			time.Sleep(time.Second)
 		default:
-			log.Printf("[Error] Worker: Error return value: %v, Worker will close", task)
+			log.Printf("[Error] Worker: Worker: Error return value: %v, Worker will close", task)
 			return
 		}
 	}
@@ -78,7 +81,6 @@ func Worker(mapf func(string, string) []KeyValue,
 
 func panicLog(msg error) {
 	log.Fatal(msg.Error())
-	panic(msg)
 }
 
 //
@@ -91,33 +93,38 @@ func GetTask() taskInfo {
 	args := GetTaskArgs{}
 	reply := GetTaskReply{}
 	if ok := call("Coordinator.GetTask", &args, &reply); !ok {
-		log.Fatal("[Warning] Worker: failed to get input task. Worker will try again.")
+		log.Print("[Warning] Worker: GetTask: failed to get input task. Worker will try again.")
 		return taskInfo{
 			Task: taskWait,
 		}
 	}
-	return reply.taskInfo
+	return taskInfo{
+		Task:        reply.Task,
+		Input:       reply.Input,
+		ReduceCount: reply.ReduceCount,
+		WorkerId:    reply.ReduceCount,
+	}
 }
 
 func kvToFile(kvInput <-chan KeyValue, outputFileName string, wg *sync.WaitGroup) {
 	defer wg.Done()
 	file, err := os.OpenFile(outputFileName+".tmp", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
-		msg := fmt.Errorf("[Error] kvToFile: file to create %s, error is %w. Worker will Panic", outputFileName, err)
-		panicLog(msg)
+		msg := fmt.Errorf("file to create %s. Option(err: %w)", outputFileName, err)
+		panicLog(fmt.Errorf("[Error] Worker: kvToFile: %w", msg))
 	}
 	defer file.Close()
 	buf := bufio.NewWriter(file)
 	enc := json.NewEncoder(buf)
 	for kv := range kvInput {
 		if err := enc.Encode(kv); err != nil {
-			msg := fmt.Errorf("[Error] kvToFile: file to write %s in %s, error is %w. Worker will Panic", kv, outputFileName, err)
-			panicLog(msg)
+			msg := fmt.Errorf("file to write %s in %s. Option(err: %w)", kv, outputFileName, err)
+			panicLog(fmt.Errorf("[Error] Worker: kvToFile: %w", msg))
 		}
 	}
 	if err := buf.Flush(); err != nil {
-		msg := fmt.Errorf("[Error] kvToFile: buf: file to flush in %s, error is %w. Worker will Panic", outputFileName, err)
-		panicLog(msg)
+		msg := fmt.Errorf("buf: file to flush in %s. Option(err: %w)", outputFileName, err)
+		panicLog(fmt.Errorf("[Error] Worker: kvToFile: %w", msg))
 	}
 	os.Rename(outputFileName+".tmp", outputFileName)
 }
@@ -126,13 +133,13 @@ func RunMap(mapf func(string, string) []KeyValue, input string) (output []string
 	filename := input
 	file, err := os.Open(filename)
 	if err != nil {
-		msg := fmt.Errorf("[Error] Worker: RunMap cannot open %v", filename)
-		panicLog(msg)
+		msg := fmt.Errorf("cannot open %v", filename)
+		panicLog(fmt.Errorf("[Error] Worker: RunMap: %w", msg))
 	}
 	content, err := io.ReadAll(file)
 	if err != nil {
-		msg := fmt.Errorf("[Error] Worker: RunMap cannot read %v", filename)
-		panicLog(msg)
+		msg := fmt.Errorf("cannot read %v", filename)
+		panicLog(fmt.Errorf("[Error] Worker: RunMap: %w", msg))
 	}
 	file.Close()
 	kva := mapf(filename, string(content))
@@ -161,11 +168,12 @@ func RunMap(mapf func(string, string) []KeyValue, input string) (output []string
 }
 
 func getPortationFiles(input string) (portationFiles []string) {
+	log.Printf("[Info] Worker: getPortationFiles: portation id is :%s", input)
 	pattern := regexp.MustCompile(`^mr-\d+-\d+$`)
 	err := filepath.WalkDir(".", func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
-			msg := fmt.Errorf("[Error] Reduce: getPortationFiles: failed to search portation %s file, error is %w. Worker will Panic", input, err)
-			panicLog(msg)
+			msg := fmt.Errorf("failed to search portation %s file. Option(err: %w)", input, err)
+			panicLog(fmt.Errorf("[Error] Worker: getPortationFiles: %w", msg))
 		}
 
 		if !d.Type().IsRegular() {
@@ -180,8 +188,8 @@ func getPortationFiles(input string) (portationFiles []string) {
 		return nil
 	})
 	if err != nil {
-		msg := fmt.Errorf("[Error] Reduce: getPortationFiles: %w", err)
-		panicLog(msg)
+		msg := fmt.Errorf("failed to walk dir. Option(err: %w)", err)
+		panicLog(fmt.Errorf("[Error] Worker: getPortationFiles: %w", msg))
 	}
 	return
 }
@@ -189,8 +197,8 @@ func getPortationFiles(input string) (portationFiles []string) {
 func readKvFile(output chan<- KeyValue, fileName string) {
 	file, err := os.OpenFile(fileName, os.O_RDONLY, 0)
 	if err != nil {
-		msg := fmt.Errorf("[Error] worker: readKvFile: fileName %s, error: %w", fileName, err)
-		panicLog(msg)
+		msg := fmt.Errorf("fileName %s. Option(err: %w)", fileName, err)
+		panicLog(fmt.Errorf("[Error] Worker: readKvFile: %w", msg))
 	}
 	defer file.Close()
 	buf := bufio.NewReader(file)
@@ -226,7 +234,7 @@ func RunReduce(reducef func(string, []string) string, input string) (outputList 
 		intermediate = append(intermediate, kv)
 	}
 	sort.Sort(ByKey(intermediate))
-	oname := fmt.Sprintf("mr-out-%d", id)
+	oname := fmt.Sprintf("mr-out-%s", input)
 	outputList = append(outputList, oname)
 	wg := sync.WaitGroup{}
 	wg.Add(1)
@@ -249,6 +257,7 @@ func RunReduce(reducef func(string, []string) string, input string) (outputList 
 
 		i = j
 	}
+	close(outputChan)
 	wg.Wait()
 	return
 }
@@ -258,13 +267,13 @@ func ReturnTask(input string, output []string) {
 		Input:    input,
 		Output:   output,
 		Task:     phase,
-		workerId: id,
+		WorkerId: id,
 	}
 	reply := ReturnTaskReply{}
 	if ok := call("Coordinator.ReturnTask", &args, &reply); ok {
-		log.Printf("Worker: input %s success return, completely task.", input)
+		log.Printf("[Info] Worker: ReturnTask: input %s success return, completely task.", input)
 	} else {
-		log.Fatalf("[Error] Worker: input %s failed return.", input)
+		log.Fatalf("[Error] Worker: ReturnTask: input %s failed return.", input)
 	}
 }
 
@@ -300,7 +309,7 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	sockname := coordinatorSock()
 	c, err := rpc.DialHTTP("unix", sockname)
 	if err != nil {
-		log.Fatal("dialing:", err)
+		log.Fatalf("[Error] Worker: call: dialing fail. Option(err: %v)", err)
 	}
 	defer c.Close()
 
