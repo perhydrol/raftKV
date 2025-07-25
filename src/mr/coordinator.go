@@ -22,6 +22,7 @@ type Coordinator struct {
 	tasks            chan taskInfo
 	wgMap            sync.WaitGroup
 	wgReduce         sync.WaitGroup
+	completeMap      sync.Map
 	nReduce          int
 	mapTasksCount    int32
 	reduceTasksCount int32
@@ -73,6 +74,25 @@ func (c *Coordinator) timeout() {
 	}
 }
 
+func (c *Coordinator) delRunning(input string) {
+	c.running.Range(
+		func(key, value any) bool {
+			if value == nil {
+				return true
+			}
+			// 使用类型断言前先获取值的副本，避免并发修改
+			v, ok := value.(runningTask)
+			if !ok {
+				log.Panicf("[Error] Master: delRunning: value cannot be resolved. value: %v", value)
+				return true
+			}
+			if v.Input == input {
+				c.running.Delete(key)
+			}
+			return true
+		})
+}
+
 func (c *Coordinator) allMapDone() {
 	c.wgMap.Wait()
 	log.Print("[Info] Master: allMapDone: all map tasks finished.")
@@ -105,7 +125,7 @@ func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
 func (c *Coordinator) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
 	select {
 	case task := <-c.tasks:
-		log.Printf("[Info] Master: GetTask: assigned task %s.", task.Input)
+		log.Printf("[Info] Master: GetTask: assigned task %s.task.WorkerId: %d", task.Input, task.WorkerId)
 		reply.Input = task.Input
 		reply.ReduceCount = task.ReduceCount
 		reply.Task = task.Task
@@ -131,6 +151,7 @@ func (c *Coordinator) ReturnTask(args *ReturnTaskArgs, reply *ReturnTaskReply) e
 			log.Printf("[Info] Master: ReturnTask: map task finished, remaining: %d.", atomic.LoadInt32(&c.mapTasksCount))
 			c.wgMap.Done()
 		}
+		c.delRunning(args.Input)
 	case taskReduce:
 		log.Printf("[Info] Master: ReturnTask: reduce task %s completed.", args.Input)
 		atomic.AddInt32(&c.reduceTasksCount, -1)
@@ -138,6 +159,7 @@ func (c *Coordinator) ReturnTask(args *ReturnTaskArgs, reply *ReturnTaskReply) e
 			log.Printf("[Info] Master: ReturnTask: reduce task finished, remaining: %d.", atomic.LoadInt32(&c.reduceTasksCount))
 			c.wgReduce.Done()
 		}
+		c.delRunning(args.Input)
 	default:
 		msg := fmt.Errorf("invalid task type: %v", args.Task)
 		log.Printf("[Warning] Master: ReturnTask: %v", msg)

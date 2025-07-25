@@ -36,6 +36,11 @@ var id int
 var reduceCount int
 var phase taskType
 
+const (
+	json_model = iota
+	reduce_model
+)
+
 // use ihash(key) % NReduce to choose the reduce
 // task number for each KeyValue emitted by Map.
 func ihash(key string) int {
@@ -53,14 +58,14 @@ func Worker(mapf func(string, string) []KeyValue,
 		task := GetTask()
 		switch task.Task {
 		case taskMap:
-			log.Printf("[Info] Worker: Worker: get a map task, reduceCount: %d", task.ReduceCount)
+			log.Printf("[Info] Worker: Worker: get a map task, reduceCount: %d, id:%d", task.ReduceCount, task.WorkerId)
 			id = task.WorkerId
 			reduceCount = task.ReduceCount
 			phase = taskMap
 			output := RunMap(mapf, task.Input)
 			ReturnTask(task.Input, output)
 		case taskReduce:
-			log.Printf("[Info] Worker: Worker: get a reduce task, reduceCount: %d", task.ReduceCount)
+			log.Printf("[Info] Worker: Worker: get a reduce task, reduceCount: %d, id:%d", task.ReduceCount, task.WorkerId)
 			id = task.WorkerId
 			reduceCount = task.ReduceCount
 			phase = taskReduce
@@ -98,15 +103,10 @@ func GetTask() taskInfo {
 			Task: taskWait,
 		}
 	}
-	return taskInfo{
-		Task:        reply.Task,
-		Input:       reply.Input,
-		ReduceCount: reply.ReduceCount,
-		WorkerId:    reply.ReduceCount,
-	}
+	return taskInfo(reply)
 }
 
-func kvToFile(kvInput <-chan KeyValue, outputFileName string, wg *sync.WaitGroup) {
+func kvToFile(kvInput <-chan KeyValue, outputFileName string, modle int, wg *sync.WaitGroup) {
 	defer wg.Done()
 	file, err := os.OpenFile(outputFileName+".tmp", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
@@ -115,18 +115,27 @@ func kvToFile(kvInput <-chan KeyValue, outputFileName string, wg *sync.WaitGroup
 	}
 	defer file.Close()
 	buf := bufio.NewWriter(file)
-	enc := json.NewEncoder(buf)
-	for kv := range kvInput {
-		if err := enc.Encode(kv); err != nil {
-			msg := fmt.Errorf("file to write %s in %s. Option(err: %w)", kv, outputFileName, err)
-			panicLog(fmt.Errorf("[Error] Worker: kvToFile: %w", msg))
+	switch modle {
+	case json_model:
+		enc := json.NewEncoder(buf)
+		for kv := range kvInput {
+			if err := enc.Encode(kv); err != nil {
+				msg := fmt.Errorf("file to write %s in %s. Option(err: %w)", kv, outputFileName, err)
+				panicLog(fmt.Errorf("[Error] Worker: kvToFile: %w", msg))
+			}
+		}
+	case reduce_model:
+		for kv := range kvInput {
+			fmt.Fprintf(buf, "%v %v\n", kv.Key, kv.Value)
 		}
 	}
 	if err := buf.Flush(); err != nil {
 		msg := fmt.Errorf("buf: file to flush in %s. Option(err: %w)", outputFileName, err)
 		panicLog(fmt.Errorf("[Error] Worker: kvToFile: %w", msg))
 	}
-	os.Rename(outputFileName+".tmp", outputFileName)
+	if err := os.Rename(outputFileName+".tmp", outputFileName); err != nil {
+		log.Printf("[Error] Worker: kvToFile: rename %s to %s filed", outputFileName+".tmp", outputFileName)
+	}
 }
 
 func RunMap(mapf func(string, string) []KeyValue, input string) (output []string) {
@@ -153,7 +162,7 @@ func RunMap(mapf func(string, string) []KeyValue, input string) (output []string
 		wg.Add(1)
 		outFileName := fmt.Sprintf("mr-%d-%d", id, i)
 		output = append(output, outFileName)
-		go kvToFile(portationChan[i], outFileName, &wg)
+		go kvToFile(portationChan[i], outFileName, json_model, &wg)
 	}
 
 	for _, kv := range kva {
@@ -239,7 +248,7 @@ func RunReduce(reducef func(string, []string) string, input string) (outputList 
 	wg := sync.WaitGroup{}
 	wg.Add(1)
 	outputChan := make(chan KeyValue, 100)
-	go kvToFile(outputChan, oname, &wg)
+	go kvToFile(outputChan, oname, reduce_model, &wg)
 	i := 0
 	for i < len(intermediate) {
 		j := i + 1
