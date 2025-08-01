@@ -34,7 +34,12 @@ func MakeLock(ck kvtest.IKVClerk, l string) *Lock {
 func (lk *Lock) Acquire() {
 	// Your code here
 	for {
+		// fmt.Printf("[Info] lock: Acquire: lock %s.\n", lk.l)
 		lockId, version, err := lk.ck.Get(lk.l)
+		if lockId == lk.id {
+			lk.version = version
+			return
+		}
 		if err == rpc.ErrNoKey || lockId == "" {
 			putErr := lk.ck.Put(lk.l, lk.id, lk.version)
 			if putErr == rpc.OK {
@@ -51,20 +56,25 @@ func (lk *Lock) Acquire() {
 func (lk *Lock) Release() {
 	// Your code here
 	for {
-		lockId, verson, err := lk.ck.Get(lk.l)
+		// fmt.Printf("[Info] lock: Release: lock %s.\n", lk.l)
+		lockId, _, err := lk.ck.Get(lk.l)
 		if err != rpc.OK {
-			continue
+			fmt.Printf("[Error] lock: Release: failed to get lock, err:%s, key:%s.\n", err, lk.l)
+			return
 		}
-		if lockId == lk.id && verson == lk.version {
-			for {
-				putErr := lk.ck.Put(lk.l, "", lk.version)
-				if putErr == rpc.OK {
-					lk.version++
-					return
-				} else {
-					fmt.Printf("[Warning] lock: Release: An error occurred while releasing key:%s value:%s version:%d, try again.\n", lk.l, lk.id, lk.version)
-				}
+		if lockId == lk.id {
+			putErr := lk.ck.Put(lk.l, "", lk.version)
+			switch putErr {
+			case rpc.OK:
+				lk.version++
+				return
+			case rpc.ErrVersion:
+				return
+			default:
+				fmt.Printf("[Warning] lock: Release: An error(%s) occurred while releasing key:%s value:%s version:%d, try again.\n", putErr, lk.l, lk.id, lk.version)
 			}
+		} else {
+			break
 		}
 	}
 }
