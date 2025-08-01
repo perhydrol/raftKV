@@ -3,13 +3,12 @@ package kvsrv
 import (
 	"fmt"
 	"sync"
+	"time"
 
 	"6.5840/kvsrv1/rpc"
 	kvtest "6.5840/kvtest1"
 	tester "6.5840/tester1"
 )
-
-const max_retry = 3
 
 type Clerk struct {
 	clnt          *tester.Clnt
@@ -41,7 +40,10 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 	var reply rpc.GetReply
 	for {
 		reply = rpc.GetReply{}
-		ck.clnt.Call(ck.server, "KVServer.Get", &args, &reply)
+		if !ck.clnt.Call(ck.server, "KVServer.Get", &args, &reply) {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
 		switch reply.Err {
 		case rpc.ErrNoKey:
 			fmt.Printf("[Warning] client: Get: key '%s' has no vaule.\n", key)
@@ -84,23 +86,27 @@ func (ck *Clerk) Put(key, value string, version rpc.Tversion) rpc.Err {
 		Version: version,
 	}
 	reply := rpc.PutReply{}
-	ck.clnt.Call(ck.server, "KVServer.Put", &args, &reply)
+	for !ck.clnt.Call(ck.server, "KVServer.Put", &args, &reply) {
+		ck.putErrVersion.Store(key, 1) // 不确定本次是否成功
+		time.Sleep(100 * time.Millisecond)
+	}
+	// fmt.Printf("[Info] client: Put: key %s , reply status %s.\n", key, reply.Err)
+	defer func() {
+		ck.putErrVersion.Delete(key)
+	}()
 	switch reply.Err {
 	case rpc.OK:
-		ck.putErrVersion.Delete(key)
 		return rpc.OK
 	case rpc.ErrVersion:
 		if _, ok := ck.putErrVersion.Load(key); !ok {
-			ck.putErrVersion.Store(key, 1)
+			// fmt.Printf("[Info] client: Put: key %s rpc first return ErrVersion.\n", key)
 			return rpc.ErrVersion
 		} else {
 			return rpc.ErrMaybe
 		}
 	case rpc.ErrNoKey:
-		ck.putErrVersion.Delete(key)
 		return rpc.ErrNoKey
 	}
 	fmt.Printf("[Warning] client: Put: An unknown error occurred '%s'.\n", reply.Err)
-	ck.putErrVersion.Delete(key)
 	return reply.Err
 }
