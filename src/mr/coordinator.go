@@ -22,7 +22,6 @@ type Coordinator struct {
 	tasks            chan taskInfo
 	wgMap            sync.WaitGroup
 	wgReduce         sync.WaitGroup
-	completeMap      sync.Map
 	nReduce          int
 	mapTasksCount    int32
 	reduceTasksCount int32
