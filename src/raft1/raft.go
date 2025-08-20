@@ -23,8 +23,8 @@ import (
 )
 
 const (
-	electionTimeOut time.Duration = 3000 * time.Millisecond
-	heartTimeOut                  = 100 * time.Millisecond
+	electionTimeOut time.Duration = 3500 * time.Millisecond
+	heartTimeOut                  = 50 * time.Millisecond
 )
 
 type nodeState int32
@@ -94,6 +94,15 @@ func (rf *Raft) sendAppendEntries(peer int, args *AppendEntriesArgs, reply *Appe
 func (rf *Raft) GetAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.logPrintf("get a AppendEntries RPC. leader:%d, Term:%d, PrevLogIndex:%d, PrevLogTerm:%d.", args.LeaderId, args.Term, args.PrevLogIndex, args.PrevLogTerm)
 	rf.mu.Lock()
+	if args.Term > rf.currentTerm {
+		rf.logPrintf("conform AppendEntries RPC and term bigger")
+		reply.Success = true
+		rf.currentTerm = args.Term
+		reply.Term = rf.currentTerm
+		rf.mu.Unlock()
+		rf.changeState(follower)
+		return
+	}
 	refuse := args.Term < rf.currentTerm ||
 		args.PrevLogIndex > rf.log[len(rf.log)-1].Index || args.PrevLogTerm != rf.log[args.PrevLogIndex].Term
 	if refuse {
@@ -103,20 +112,11 @@ func (rf *Raft) GetAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRe
 		rf.mu.Unlock()
 		return
 	}
-	if args.Term > rf.currentTerm {
-		rf.logPrintf("conform AppendEntries RPC and term bigger")
-		reply.Success = true
-		rf.currentTerm = reply.Term
-		reply.Term = rf.currentTerm
-		rf.mu.Unlock()
-		rf.changeState(follower)
-		return
-	}
 	rf.logPrintf("conform AppendEntries RPC")
 	reply.Success = true
 	reply.Term = rf.currentTerm
-	rf.electionTimer.Reset(electionTimeOut)
 	rf.mu.Unlock()
+	rf.changeState(follower)
 }
 
 func (rf *Raft) changeState(to nodeState) {
@@ -126,7 +126,8 @@ func (rf *Raft) changeState(to nodeState) {
 	switch to {
 	case leader:
 		if rf.state == candidate {
-			rf.logPrintf("Become a leader.")
+			oldState := rf.state
+			rf.logPrintf("Become a leader from state %d.", oldState)
 			rf.state = leader
 			go rf.leaderHeart()
 		}
@@ -159,6 +160,9 @@ func (rf *Raft) leaderHeart() {
 			return
 		}
 		for peer := range rf.peers {
+			if peer == rf.me {
+				continue
+			}
 			go func(peer int) {
 				reply := &AppendEntriesReply{}
 				for {
@@ -361,19 +365,23 @@ func (rf *Raft) election(ctx context.Context) {
 			select {
 			case <-ctx.Done():
 				return
-			case <-getVoteChan:
-				voteCount++
-				rf.logPrintf("Get a vote. voteCount:%d, half:%d", voteCount, len(rf.peers)/2)
-				if voteCount > len(rf.peers)/2 {
-					rf.changeState(leader)
+			case _, ok := <-getVoteChan:
+				if ok {
+					voteCount++
+					rf.logPrintf("Get a vote. voteCount:%d, half:%d", voteCount, len(rf.peers)/2)
+					if voteCount > len(rf.peers)/2 {
+						rf.changeState(leader)
+						return
+					}
+				}
+			case term, ok := <-biggerTermChan:
+				if ok {
+					rf.mu.Lock()
+					rf.currentTerm = term
+					rf.mu.Unlock()
+					rf.changeState(follower)
 					return
 				}
-			case term := <-biggerTermChan:
-				rf.mu.Lock()
-				rf.currentTerm = term
-				rf.mu.Unlock()
-				rf.changeState(follower)
-				return
 			}
 		}
 	}()
@@ -439,7 +447,10 @@ func (rf *Raft) ticker() {
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 
 		<-rf.electionTimer.C
-		if rf.state != leader {
+		rf.mu.Lock()
+		currentState := rf.state
+		rf.mu.Unlock()
+		if currentState != leader {
 			rf.logPrintf("Begin election.")
 			ctx, _ := context.WithTimeout(context.Background(), electionTimeOut)
 			go func() {
