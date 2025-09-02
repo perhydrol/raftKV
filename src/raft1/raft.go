@@ -9,7 +9,6 @@ package raft
 import (
 	//	"bytes"
 
-	"context"
 	"fmt"
 	"math/rand"
 	"sync"
@@ -23,8 +22,8 @@ import (
 )
 
 const (
-	electionTimeOut time.Duration = 3500 * time.Millisecond
-	heartTimeOut                  = 50 * time.Millisecond
+	electionTimeOut = 300
+	heartTimeOut    = 50
 )
 
 type nodeState int32
@@ -61,10 +60,21 @@ type Raft struct {
 
 	state nodeState
 
-	electionTimer *time.Timer
+	electionTimer      *time.Timer
+	resetElectionTimer chan struct{}
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+}
+
+func (rf *Raft) updateTerm(newTerm int) {
+	if newTerm < rf.currentTerm {
+		msg := fmt.Sprintf("ERROR: want to reduce term.(newTerm:%d, oldTerm:%d)", newTerm, rf.currentTerm)
+		rf.logPrintf(msg)
+		panic(msg)
+	} else {
+		rf.currentTerm = newTerm
+	}
 }
 
 type Entry struct {
@@ -94,13 +104,12 @@ func (rf *Raft) sendAppendEntries(peer int, args *AppendEntriesArgs, reply *Appe
 func (rf *Raft) GetAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.logPrintf("get a AppendEntries RPC. leader:%d, Term:%d, PrevLogIndex:%d, PrevLogTerm:%d.", args.LeaderId, args.Term, args.PrevLogIndex, args.PrevLogTerm)
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	if args.Term > rf.currentTerm {
-		rf.logPrintf("conform AppendEntries RPC and term bigger")
+		rf.logPrintf("Find a bigger Term: oldTerm:%d newTerm:%d. changeState to follower.", rf.currentTerm, args.Term)
 		reply.Success = true
-		rf.currentTerm = args.Term
-		reply.Term = rf.currentTerm
-		rf.mu.Unlock()
-		rf.changeState(follower)
+		reply.Term = args.Term
+		go rf.changeState(follower, -1, args.Term)
 		return
 	}
 	refuse := args.Term < rf.currentTerm ||
@@ -109,76 +118,91 @@ func (rf *Raft) GetAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRe
 		rf.logPrintf("refuse AppendEntries RPC")
 		reply.Success = false
 		reply.Term = rf.currentTerm
-		rf.mu.Unlock()
 		return
 	}
 	rf.logPrintf("conform AppendEntries RPC")
 	reply.Success = true
 	reply.Term = rf.currentTerm
-	rf.mu.Unlock()
-	rf.changeState(follower)
+	go rf.changeState(follower, -1, rf.currentTerm)
 }
 
-func (rf *Raft) changeState(to nodeState) {
+func (rf *Raft) changeState(to nodeState, votedFor int, term int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	rf.electionTimer.Reset(electionTimeOut)
+	rf.logPrintf("changeState: from %d to %d, votedFor: %d, term: %d", rf.state, to, votedFor, term)
+
+	select {
+	case rf.resetElectionTimer <- struct{}{}:
+	default:
+	}
+	rf.votedFor = votedFor
+	if to != candidate {
+		rf.updateTerm(term)
+	}
 	switch to {
-	case leader:
-		if rf.state == candidate {
-			oldState := rf.state
-			rf.logPrintf("Become a leader from state %d.", oldState)
-			rf.state = leader
-			go rf.leaderHeart()
-		}
 	case follower:
-		rf.logPrintf("Become a follower.")
 		rf.state = follower
-		rf.votedFor = -1
+	case leader:
+		if rf.state == leader {
+			break
+		}
+		rf.logPrintf("become a leader")
+		rf.state = leader
+		go rf.leaderHeart()
 	case candidate:
-		rf.logPrintf("Become a candidate.")
-		rf.state = candidate
-		rf.votedFor = rf.me
-		rf.currentTerm++
+		if rf.state != leader {
+			rf.logPrintf("become a candidate")
+			rf.state = candidate
+			rf.currentTerm++
+			go rf.election()
+		}
+	default:
+		panic("Wrong state.")
 	}
 }
 
 func (rf *Raft) leaderHeart() {
-	rf.mu.Lock()
-	heartArgs := &AppendEntriesArgs{
-		Term:         rf.currentTerm,
-		LeaderId:     rf.me,
-		PrevLogIndex: rf.log[len(rf.log)-1].Index,
-		PrevLogTerm:  rf.log[len(rf.log)-1].Term,
-		Entries:      nil,
-		LeaderCommit: rf.commitIndex,
-	}
-	rf.mu.Unlock()
-	rf.logPrintf("Begin to seed Heart.")
-	for range time.Tick(heartTimeOut) {
-		if atomic.LoadInt32((*int32)(&rf.state)) != int32(leader) {
+	// 获取当前时间戳（纳秒精度）
+	timestamp := uint64(time.Now().UnixNano())
+
+	// 组合时间戳和随机数
+	goID := timestamp ^ 0xFFFF // 使用低16位随机数
+	for !rf.killed() {
+		rf.mu.Lock()
+		if rf.state == leader {
+			rf.logPrintf("send leaderHeart.(%s)", goID)
+			heartPacket := AppendEntriesArgs{
+				Term:         rf.currentTerm,
+				LeaderId:     rf.me,
+				PrevLogIndex: rf.log[len(rf.log)-1].Index,
+				PrevLogTerm:  rf.log[len(rf.log)-1].Term,
+				Entries:      nil,
+				LeaderCommit: rf.commitIndex,
+			}
+			rf.mu.Unlock()
+			for i := range rf.peers {
+				if i == rf.me {
+					continue
+				}
+				i := i
+				go func() {
+					reply := AppendEntriesReply{}
+					for !rf.sendAppendEntries(i, &heartPacket, &reply) {
+					}
+					rf.mu.Lock()
+					defer rf.mu.Unlock()
+					if !reply.Success && reply.Term > rf.currentTerm {
+						rf.logPrintf("Find a bigger Term: oldTerm:%d newTerm:%d. changeState to follower.", rf.currentTerm, reply.Term)
+						go rf.changeState(follower, -1, reply.Term)
+					}
+				}()
+			}
+		} else {
+			rf.logPrintf("not a leader, quit leaderHeart.")
+			rf.mu.Unlock()
 			return
 		}
-		for peer := range rf.peers {
-			if peer == rf.me {
-				continue
-			}
-			go func(peer int) {
-				reply := &AppendEntriesReply{}
-				for {
-					if atomic.LoadInt32((*int32)(&rf.state)) != int32(leader) {
-						return
-					} else {
-						if rf.sendAppendEntries(peer, heartArgs, reply) {
-							if reply.Term > heartArgs.Term {
-								rf.changeState(follower)
-							}
-							return
-						}
-					}
-				}
-			}(peer)
-		}
+		<-time.After(time.Duration(heartTimeOut) * time.Millisecond)
 	}
 }
 
@@ -270,26 +294,22 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	rf.logPrintf("income a requestVote. argTerm:%d,Candidate:%d", args.Term, args.CandidateId)
-	hasVotedForOther := rf.votedFor != -1 || rf.votedFor != args.CandidateId
+	hasVotedForOther := rf.votedFor != -1 && rf.votedFor != args.CandidateId
 	rfLastLog := &rf.log[len(rf.log)-1]
 	upToDateLog := args.LastLogTerm > rfLastLog.Term ||
 		(args.LastLogTerm == rfLastLog.Term && args.LastLogIndex >= rfLastLog.Index)
-	if args.Term > rf.currentTerm || (!hasVotedForOther && upToDateLog) {
+	if (args.Term > rf.currentTerm && upToDateLog) || (args.Term == rf.currentTerm && !hasVotedForOther && upToDateLog) {
 		rf.logPrintf("Vote to :%d", args.CandidateId)
 		reply.VoteGranted = true
-		rf.currentTerm = args.Term
-		reply.Term = rf.currentTerm
-		rf.votedFor = args.CandidateId
-		rf.electionTimer.Reset(electionTimeOut) //投票成功了，需要重置选举超时
-		rf.mu.Unlock()
-		rf.changeState(follower)
+		reply.Term = args.Term
+		go rf.changeState(follower, args.CandidateId, args.Term)
 		return
 	} else {
 		rf.logPrintf("NOT Vote to :%d", args.CandidateId)
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
-		rf.mu.Unlock()
 		return
 	}
 }
@@ -326,72 +346,63 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-func (rf *Raft) election(ctx context.Context) {
-	rf.changeState(candidate) // 负责处理term、votedFor、重置计时器
+func (rf *Raft) election() {
+	rf.logPrintf("begin a new election.")
+	getVoteCount := 1
 	rf.mu.Lock()
-	req := &RequestVoteArgs{
+	requestVote := &RequestVoteArgs{
 		Term:         rf.currentTerm,
 		CandidateId:  rf.me,
 		LastLogIndex: rf.log[len(rf.log)-1].Index,
 		LastLogTerm:  rf.log[len(rf.log)-1].Term,
 	}
 	rf.mu.Unlock()
-	biggerTermChan := make(chan int, len(rf.peers))
-	getVoteChan := make(chan struct{}, len(rf.peers))
+	replyChan := make(chan *RequestVoteReply, len(rf.peers))
 	wg := sync.WaitGroup{}
-	for peer := range rf.peers {
-		if peer == rf.me {
+	defer func() {
+		wg.Wait()
+		close(replyChan)
+	}()
+	for i := range rf.peers {
+		if i == rf.me {
 			continue
 		}
+		i := i
 		wg.Add(1)
-		go func(peer int) {
+		go func() {
 			defer wg.Done()
 			reply := &RequestVoteReply{}
-			if rf.sendRequestVote(peer, req, reply) {
-				if reply.Term > req.Term {
-					rf.logPrintf("find a bigger Term. NewTerm:%d, OldTerm:%d", reply.Term, req.Term)
-					biggerTermChan <- reply.Term
-				}
-				if reply.VoteGranted {
-					rf.logPrintf("Get a new Vote.")
-					getVoteChan <- struct{}{}
-				}
+			if ok := rf.sendRequestVote(i, requestVote, reply); ok {
+				replyChan <- reply
 			}
-		}(peer)
+		}()
 	}
-	go func() {
-		voteCount := 1
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case _, ok := <-getVoteChan:
-				if ok {
-					voteCount++
-					rf.logPrintf("Get a vote. voteCount:%d, half:%d", voteCount, len(rf.peers)/2)
-					if voteCount > len(rf.peers)/2 {
-						rf.changeState(leader)
-						return
-					}
-				}
-			case term, ok := <-biggerTermChan:
-				if ok {
-					rf.mu.Lock()
-					rf.currentTerm = term
+	for {
+		select {
+		case reply := <-replyChan:
+			rf.mu.Lock()
+			// 避免之前的信息延迟后到达，错误的当选。只有任期匹配同时节点确实为候选人才当选
+			if reply.VoteGranted && reply.Term == rf.currentTerm && rf.state == candidate {
+				getVoteCount++
+				if getVoteCount > len(rf.peers)/2 {
+					rf.logPrintf("Get majority votes")
+					go rf.changeState(leader, -1, rf.currentTerm)
 					rf.mu.Unlock()
-					rf.changeState(follower)
+					return
+				}
+			} else {
+				if reply.Term > rf.currentTerm {
+					rf.logPrintf("Find a bigger Term: oldTerm:%d newTerm:%d. changeState to follower.", rf.currentTerm, reply.Term)
+					go rf.changeState(follower, -1, reply.Term)
+					rf.mu.Unlock()
 					return
 				}
 			}
+			rf.mu.Unlock()
+		case <-time.After(time.Duration(electionTimeOut) * time.Millisecond):
+			return
 		}
-	}()
-	go func() {
-		wg.Wait()
-		time.Sleep(500 * time.Millisecond)
-		rf.logPrintf("electionFunc's channel close.")
-		close(biggerTermChan)
-		close(getVoteChan)
-	}()
+	}
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -435,6 +446,17 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+func (rf *Raft) resetElection() {
+	rf.logPrintf("Reset time.")
+	if !rf.electionTimer.Stop() {
+		select {
+		case <-rf.electionTimer.C:
+		default:
+		}
+	}
+	rf.electionTimer.Reset(time.Duration(electionTimeOut+rand.Intn(100)) * time.Millisecond)
+}
+
 func (rf *Raft) ticker() {
 	for !rf.killed() {
 
@@ -443,19 +465,15 @@ func (rf *Raft) ticker() {
 
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
-		ms := 50 + (rand.Int63() % 350)
-		time.Sleep(time.Duration(ms) * time.Millisecond)
-
-		<-rf.electionTimer.C
-		rf.mu.Lock()
-		currentState := rf.state
-		rf.mu.Unlock()
-		if currentState != leader {
-			rf.logPrintf("Begin election.")
-			ctx, _ := context.WithTimeout(context.Background(), electionTimeOut)
-			go func() {
-				rf.election(ctx)
-			}()
+		select {
+		case <-rf.electionTimer.C:
+			go rf.changeState(candidate, rf.me, rf.currentTerm+1)
+			select {
+			case rf.resetElectionTimer <- struct{}{}:
+			default:
+			}
+		case <-rf.resetElectionTimer:
+			rf.resetElection()
 		}
 	}
 }
@@ -472,16 +490,17 @@ func (rf *Raft) ticker() {
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *tester.Persister, applyCh chan raftapi.ApplyMsg) raftapi.Raft {
 	rf := &Raft{
-		mu:            sync.Mutex{},
-		currentTerm:   0,
-		votedFor:      -1,
-		log:           make([]Entry, 0),
-		commitIndex:   0,
-		lastApplied:   0,
-		nextIndex:     make([]int, len(peers)),
-		matchIndex:    make([]int, len(peers)),
-		state:         follower,
-		electionTimer: time.NewTimer(10 * time.Millisecond),
+		mu:                 sync.Mutex{},
+		currentTerm:        0,
+		votedFor:           -1,
+		log:                make([]Entry, 0),
+		commitIndex:        0,
+		lastApplied:        0,
+		nextIndex:          make([]int, len(peers)),
+		matchIndex:         make([]int, len(peers)),
+		state:              follower,
+		electionTimer:      time.NewTimer(time.Duration(rand.Intn(100)) * time.Millisecond),
+		resetElectionTimer: make(chan struct{}, 1),
 	}
 	rf.peers = peers
 	rf.persister = persister
