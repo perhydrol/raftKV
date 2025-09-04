@@ -102,14 +102,14 @@ func (rf *Raft) sendAppendEntries(peer int, args *AppendEntriesArgs, reply *Appe
 }
 
 func (rf *Raft) GetAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	rf.logPrintf("get a AppendEntries RPC. leader:%d, Term:%d, PrevLogIndex:%d, PrevLogTerm:%d.", args.LeaderId, args.Term, args.PrevLogIndex, args.PrevLogTerm)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	rf.logPrintf("get a AppendEntries RPC. leader:%d, Term:%d, PrevLogIndex:%d, PrevLogTerm:%d.", args.LeaderId, args.Term, args.PrevLogIndex, args.PrevLogTerm)
 	if args.Term > rf.currentTerm {
 		rf.logPrintf("Find a bigger Term: oldTerm:%d newTerm:%d. changeState to follower.", rf.currentTerm, args.Term)
 		reply.Success = true
 		reply.Term = args.Term
-		go rf.changeState(follower, -1, args.Term)
+		rf.changeState(follower, -1, args.Term)
 		return
 	}
 	refuse := args.Term < rf.currentTerm ||
@@ -123,12 +123,10 @@ func (rf *Raft) GetAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRe
 	rf.logPrintf("conform AppendEntries RPC")
 	reply.Success = true
 	reply.Term = rf.currentTerm
-	go rf.changeState(follower, -1, rf.currentTerm)
+	rf.changeState(follower, -1, rf.currentTerm)
 }
 
 func (rf *Raft) changeState(to nodeState, votedFor int, term int) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	rf.logPrintf("changeState: from %d to %d, votedFor: %d, term: %d", rf.state, to, votedFor, term)
 
 	select {
@@ -193,7 +191,7 @@ func (rf *Raft) leaderHeart() {
 					defer rf.mu.Unlock()
 					if !reply.Success && reply.Term > rf.currentTerm {
 						rf.logPrintf("Find a bigger Term: oldTerm:%d newTerm:%d. changeState to follower.", rf.currentTerm, reply.Term)
-						go rf.changeState(follower, -1, reply.Term)
+						rf.changeState(follower, -1, reply.Term)
 					}
 				}()
 			}
@@ -304,7 +302,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.logPrintf("Vote to :%d", args.CandidateId)
 		reply.VoteGranted = true
 		reply.Term = args.Term
-		go rf.changeState(follower, args.CandidateId, args.Term)
+		rf.changeState(follower, args.CandidateId, args.Term)
 		return
 	} else {
 		rf.logPrintf("NOT Vote to :%d", args.CandidateId)
@@ -347,9 +345,9 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 }
 
 func (rf *Raft) election() {
-	rf.logPrintf("begin a new election.")
 	getVoteCount := 1
 	rf.mu.Lock()
+	rf.logPrintf("begin a new election.")
 	requestVote := &RequestVoteArgs{
 		Term:         rf.currentTerm,
 		CandidateId:  rf.me,
@@ -386,14 +384,14 @@ func (rf *Raft) election() {
 				getVoteCount++
 				if getVoteCount > len(rf.peers)/2 {
 					rf.logPrintf("Get majority votes")
-					go rf.changeState(leader, -1, rf.currentTerm)
+					rf.changeState(leader, -1, rf.currentTerm)
 					rf.mu.Unlock()
 					return
 				}
 			} else {
 				if reply.Term > rf.currentTerm {
 					rf.logPrintf("Find a bigger Term: oldTerm:%d newTerm:%d. changeState to follower.", rf.currentTerm, reply.Term)
-					go rf.changeState(follower, -1, reply.Term)
+					rf.changeState(follower, -1, reply.Term)
 					rf.mu.Unlock()
 					return
 				}
@@ -447,6 +445,8 @@ func (rf *Raft) killed() bool {
 }
 
 func (rf *Raft) resetElection() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	rf.logPrintf("Reset time.")
 	if !rf.electionTimer.Stop() {
 		select {
@@ -467,7 +467,11 @@ func (rf *Raft) ticker() {
 		// milliseconds.
 		select {
 		case <-rf.electionTimer.C:
-			go rf.changeState(candidate, rf.me, rf.currentTerm+1)
+			go func() {
+				rf.mu.Lock()
+				rf.changeState(candidate, rf.me, rf.currentTerm+1)
+				rf.mu.Unlock()
+			}()
 			select {
 			case rf.resetElectionTimer <- struct{}{}:
 			default:
