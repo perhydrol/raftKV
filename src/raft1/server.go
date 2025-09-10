@@ -9,8 +9,7 @@ import (
 	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
-	"6.5840/tester1"
-
+	tester "6.5840/tester1"
 )
 
 const (
@@ -18,7 +17,6 @@ const (
 )
 
 var useRaftStateMachine bool // to plug in another raft besided raft1
-
 
 type rfsrv struct {
 	ts          *Test
@@ -102,6 +100,7 @@ func (rs *rfsrv) applier(applyCh chan raftapi.ApplyMsg) {
 		if m.CommandValid == false {
 			// ignore other types of ApplyMsg
 		} else {
+			fmt.Printf("[Tester] get a new applyCh: CommandValid:%v, CommandIndex:%d\n", m.CommandValid, m.CommandIndex)
 			err_msg, prevok := rs.ts.checkLogs(rs.me, m)
 			if m.CommandIndex > 1 && prevok == false {
 				err_msg = fmt.Sprintf("server %v apply out of order %v", rs.me, m.CommandIndex)

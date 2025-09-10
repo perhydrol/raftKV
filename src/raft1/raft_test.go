@@ -10,6 +10,10 @@ package raft
 
 import (
 	"fmt"
+	"os"
+	"runtime"
+	"runtime/pprof"
+
 	// "log"
 	"math/rand"
 	"sync"
@@ -19,6 +23,39 @@ import (
 
 	tester "6.5840/tester1"
 )
+
+func profile() {
+	// CPU Profile
+	cpuFile, _ := os.Create("cpu.prof")
+	pprof.StartCPUProfile(cpuFile)
+	defer pprof.StopCPUProfile()
+
+	// Block Profile
+	runtime.SetBlockProfileRate(1)
+	defer func() {
+		blockFile, _ := os.Create("block.prof")
+		pprof.Lookup("block").WriteTo(blockFile, 0)
+		blockFile.Close()
+	}()
+
+	// ... 在这里运行你的测试代码或业务逻辑 ...
+	// 例如:
+	// yourTestFunction()
+
+	// 睡眠一段时间确保有足够数据被收集
+	time.Sleep(10 * time.Second)
+
+	// Memory Profile
+	memFile, _ := os.Create("mem.prof")
+	runtime.GC()
+	pprof.WriteHeapProfile(memFile)
+	memFile.Close()
+
+	// Goroutine Profile
+	goroutineFile, _ := os.Create("goroutine.prof")
+	pprof.Lookup("goroutine").WriteTo(goroutineFile, 1)
+	goroutineFile.Close()
+}
 
 // The tester generously allows solutions to complete elections in one second
 // (much more than the paper's range of timeouts).
@@ -132,6 +169,7 @@ func TestManyElections3A(t *testing.T) {
 }
 
 func TestBasicAgree3B(t *testing.T) {
+	profile()
 	servers := 3
 	ts := makeTest(t, servers, true, false)
 	defer ts.cleanup()

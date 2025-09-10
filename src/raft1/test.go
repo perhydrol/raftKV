@@ -11,7 +11,7 @@ import (
 
 	"6.5840/labrpc"
 	"6.5840/raftapi"
-	"6.5840/tester1"
+	tester "6.5840/tester1"
 )
 
 type Test struct {
@@ -190,7 +190,6 @@ func (ts *Test) nCommitted(index int) (int, any) {
 		}
 
 		cmd1, ok := rs.Logs(index)
-
 		if ok {
 			if count > 0 && cmd != cmd1 {
 				text := fmt.Sprintf("committed values at index %v do not match (%v != %v)",

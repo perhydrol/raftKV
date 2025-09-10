@@ -2,3 +2,5 @@ pkg/
 *-handin.tar.gz
 diff.txt
 *.log
+*.prof
+*.test
