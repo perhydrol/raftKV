@@ -116,6 +116,21 @@ func (l *logList) GetSlice(begin, end int) []Entry {
 	return l.log[begin:end]
 }
 
+// beginIndex 本身也会被删除
+func (l *logList) removeAfter(beginIndex int) {
+	if beginIndex > l.log[len(l.log)-1].Index {
+		return
+	}
+	removeLogBegin := -1
+	for i := l.log[len(l.log)-1].Index; i >= beginIndex; i-- {
+		removeLogBegin = i
+	}
+	l.log = l.log[:removeLogBegin]
+	l.beginIndex = l.log[0].Index
+	l.endIndex = l.log[len(l.log)-1].Index
+	l.Size = len(l.log)
+}
+
 func (rf *Raft) updateTerm(newTerm int) {
 	if newTerm < rf.currentTerm {
 		msg := fmt.Sprintf("ERROR: want to reduce term.(newTerm:%d, oldTerm:%d)", newTerm, rf.currentTerm)
@@ -158,6 +173,12 @@ func (rf *Raft) GetAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRe
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	rf.logPrintf("get a AppendEntries RPC. leader:%d, Term:%d, PrevLogIndex:%d, PrevLogTerm:%d.", args.LeaderId, args.Term, args.PrevLogIndex, args.PrevLogTerm)
+	if args.Term < rf.currentTerm {
+		rf.logPrintf("refuse becouse rpc's term < rf.Term")
+		reply.Term = rf.currentTerm
+		reply.Success = false
+		return
+	}
 	if args.Term > rf.currentTerm {
 		rf.logPrintf("Find a bigger Term: oldTerm:%d newTerm:%d. changeState to follower.", rf.currentTerm, args.Term)
 		reply.Term = args.Term
@@ -165,8 +186,7 @@ func (rf *Raft) GetAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRe
 		reply.Success = rf.replyAppendEntries(args, reply)
 		return
 	}
-	refuse := args.Term < rf.currentTerm ||
-		args.PrevLogIndex > rf.log.GetLast().Index ||
+	refuse := args.PrevLogIndex > rf.log.GetLast().Index ||
 		args.PrevLogTerm != rf.log.Get(args.PrevLogIndex).Term
 	if refuse {
 		rf.logPrintf("refuse AppendEntries RPC: rf.log.GetLast().Index: %d, rf.log.GetLast().Term: %d", rf.log.GetLast().Index, rf.log.GetLast().Term)
@@ -190,7 +210,7 @@ func (rf *Raft) replyAppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 			if args.Entries != nil {
 				rf.log.AppendList(args.PrevLogIndex+1, args.Entries)
 			}
-			rf.commitLogBeforIndex(args.LeaderCommit)
+			rf.commitLogBeforIndex(args.LeaderCommit, args.Term)
 			return true
 		}
 	}
@@ -214,9 +234,21 @@ func (rf *Raft) replyAppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 	return false
 }
 
-func (rf *Raft) commitLogBeforIndex(leaderCommit int) {
+func (rf *Raft) commitLogBeforIndex(leaderCommit int, leaderTerm int) {
 	if leaderCommit <= rf.commitIndex {
 		rf.logPrintf("Waring: index begin: %d ~ end: %d commited and logSize: %d", rf.commitIndex, leaderCommit, rf.log.Size)
+		return
+	}
+	isHasLeaderTermLog := false
+	for i := rf.log.endIndex; i >= rf.log.beginIndex; i-- {
+		if rf.log.Get(i).Term == leaderTerm {
+			isHasLeaderTermLog = true
+			break
+		}
+	}
+	// 没有与leader同步过日志，不允许提交
+	if !isHasLeaderTermLog {
+		rf.logPrintf("The log has not been synchronized with the leader, so submission is not allowed.")
 		return
 	}
 	rf.logPrintf("index begin: %d ~ end: %d commited and logSize: %d", rf.commitIndex, leaderCommit, rf.log.Size)
@@ -301,6 +333,8 @@ func (rf *Raft) leaderHeart() {
 					if !reply.Success && reply.Term > rf.currentTerm {
 						// rf.logPrintf("Find a bigger Term: oldTerm:%d newTerm:%d. changeState to follower.", rf.currentTerm, reply.Term)
 						rf.changeState(follower, -1, reply.Term)
+					} else {
+						rf.updateNextIndex(i, reply, heartPacket)
 					}
 				}()
 			}
@@ -574,7 +608,7 @@ func (rf *Raft) commitLog(logIndex int, successReply <-chan struct{}) {
 				rf.mu.Lock()
 				defer rf.mu.Unlock()
 				rf.logPrintf("logIndex: %d get majority and commitIndex: %d", logIndex, rf.commitIndex)
-				rf.commitLogBeforIndex(logIndex)
+				rf.commitLogBeforIndex(logIndex, rf.currentTerm)
 				return
 			}
 		case <-ticker.C:
@@ -605,6 +639,42 @@ func (rf *Raft) genAppendEntriesArgs(server int) AppendEntriesArgs {
 	return args
 }
 
+func (rf *Raft) updateNextIndex(server int, appendEntiresReply AppendEntriesReply, appendEntiresArgs AppendEntriesArgs) {
+	// 过期的响应
+	if appendEntiresArgs.Term < rf.currentTerm {
+		return
+	}
+	rf.logPrintf("server:{id: %d, term: %d, success: %v, XTerm: %d, XIndex: %d, XLen: %d}",
+		server, appendEntiresReply.Term, appendEntiresReply.Success, appendEntiresReply.XTerm, appendEntiresReply.XIndex, appendEntiresReply.XLen)
+	if appendEntiresReply.Success {
+		if len(appendEntiresArgs.Entries) != 0 {
+			rf.nextIndex[server] = appendEntiresArgs.Entries[len(appendEntiresArgs.Entries)-1].Index
+		}
+		return
+	}
+	if appendEntiresReply.Term > rf.currentTerm {
+		rf.changeState(follower, -1, appendEntiresReply.Term)
+		rf.mu.Unlock()
+		return
+	} else {
+		if appendEntiresReply.XTerm != -1 {
+			isHasTerm := false
+			for i := rf.log.GetLast().Index; i >= rf.log.GetBegin().Index; i-- {
+				if rf.log.Get(i).Term == appendEntiresReply.Term {
+					rf.nextIndex[server] = i + 1
+					isHasTerm = true
+					break
+				}
+			}
+			if !isHasTerm {
+				rf.nextIndex[server] = appendEntiresReply.XIndex
+			}
+		} else {
+			rf.nextIndex[server] = rf.log.GetLast().Index - appendEntiresReply.XLen
+		}
+	}
+}
+
 func (rf *Raft) sendLog(server int, successReply chan<- struct{}, wg *sync.WaitGroup) {
 	defer wg.Done()
 	rf.mu.Lock()
@@ -613,7 +683,8 @@ func (rf *Raft) sendLog(server int, successReply chan<- struct{}, wg *sync.WaitG
 	for !rf.killed() && isLeader {
 		appendEntriesArgs := rf.genAppendEntriesArgs(server)
 		appendEntiresReply := AppendEntriesReply{}
-		rf.sendAppendEntries(server, &appendEntriesArgs, &appendEntiresReply)
+		for !rf.sendAppendEntries(server, &appendEntriesArgs, &appendEntiresReply) {
+		}
 		if appendEntiresReply.Success {
 			successReply <- struct{}{}
 			return
@@ -621,24 +692,8 @@ func (rf *Raft) sendLog(server int, successReply chan<- struct{}, wg *sync.WaitG
 			rf.mu.Lock()
 			if appendEntiresReply.Term > rf.currentTerm {
 				rf.changeState(follower, -1, appendEntiresReply.Term)
-				rf.mu.Unlock()
-				return
 			} else {
-				if appendEntiresReply.XTerm != -1 {
-					isHasTerm := false
-					for i := rf.log.GetLast().Index; i >= rf.log.GetBegin().Index; i-- {
-						if rf.log.Get(i).Term == appendEntiresReply.Term {
-							rf.nextIndex[server] = i + 1
-							isHasTerm = true
-							break
-						}
-					}
-					if !isHasTerm {
-						rf.nextIndex[server] = appendEntiresReply.XIndex
-					}
-				} else {
-					rf.nextIndex[server] = rf.log.GetLast().Index - appendEntiresReply.XLen
-				}
+				rf.updateNextIndex(server, appendEntiresReply, appendEntriesArgs)
 			}
 			isLeader = rf.state == leader
 			rf.mu.Unlock()
