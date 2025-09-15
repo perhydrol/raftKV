@@ -169,7 +169,6 @@ func TestManyElections3A(t *testing.T) {
 }
 
 func TestBasicAgree3B(t *testing.T) {
-	profile()
 	servers := 3
 	ts := makeTest(t, servers, true, false)
 	defer ts.cleanup()

@@ -21,6 +21,8 @@ import (
 	tester "6.5840/tester1"
 )
 
+const debug = true
+
 const (
 	electionTimeOut = 300
 	heartTimeOut    = 50
@@ -35,10 +37,10 @@ const (
 )
 
 func (rf *Raft) logPrintf(format string, a ...interface{}) {
-	if false {
+	if !debug {
 		return
 	} else {
-		newFormat := fmt.Sprintf("[%s] Id:%d Term:%d State:%d : %s\n", time.Now(), rf.me, rf.currentTerm, rf.state, format)
+		newFormat := fmt.Sprintf("[%s] Id:%d Term:%d State:%d lastLogIndex:%d : %s\n", time.Now(), rf.me, rf.currentTerm, rf.state, rf.log.endIndex, format)
 		fmt.Printf(newFormat, a...)
 	}
 }
@@ -79,6 +81,11 @@ type logList struct {
 }
 
 func (l *logList) Get(logIndex int) Entry {
+	if (logIndex - l.beginIndex) < 0 {
+		msg := fmt.Sprintf("logIndex: %d, l.beginIndex: %d\n", logIndex, l.beginIndex)
+		fmt.Println(msg)
+		panic(msg)
+	}
 	return l.log[logIndex-l.beginIndex]
 }
 
@@ -206,7 +213,7 @@ func (rf *Raft) replyAppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 		prevLogEntry := rf.log.Get(args.PrevLogIndex)
 		if prevLogEntry.Term == args.PrevLogTerm {
 			rf.logPrintf("acquire Entry from leader(%d): PrevLogIndex: %d, rpcEntiresSize: %d, rf.log.Last.Index(before append): %d, commitIndex: %d",
-				args.LeaderId, len(args.Entries), args.PrevLogIndex, rf.log.GetLast().Index, args.LeaderCommit)
+				args.LeaderId, args.PrevLogIndex, len(args.Entries), rf.log.GetLast().Index, args.LeaderCommit)
 			if args.Entries != nil {
 				rf.log.AppendList(args.PrevLogIndex+1, args.Entries)
 			}
@@ -216,11 +223,11 @@ func (rf *Raft) replyAppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 	}
 	// 校验失败，需要检查冲突项目
 	rf.logPrintf("refuse Entry from leader(%d): PrevLogIndex: %d, rpcEntiresSize: %d, rf.log.Last.Index(before append): %d, commitIndex: %d",
-		args.LeaderId, len(args.Entries), args.PrevLogIndex, rf.log.GetLast().Index, args.LeaderCommit)
-	if args.PrevLogIndex < rf.log.GetLast().Index {
+		args.LeaderId, args.PrevLogIndex, len(args.Entries), rf.log.GetLast().Index, args.LeaderCommit)
+	if args.PrevLogIndex <= rf.log.GetLast().Index {
 		reply.XTerm = rf.log.Get(args.PrevLogIndex).Term
 		reply.XIndex = 0
-		for i := rf.log.GetLast().Index; i > rf.log.GetBegin().Index; i-- {
+		for i := rf.log.GetLast().Index; i >= rf.log.GetBegin().Index; i-- {
 			if rf.log.Get(i).Term == reply.XTerm {
 				reply.XIndex = rf.log.Get(i).Index
 			}
@@ -262,7 +269,7 @@ func (rf *Raft) commitLogBeforIndex(leaderCommit int, leaderTerm int) {
 }
 
 func (rf *Raft) changeState(to nodeState, votedFor int, term int) {
-	// rf.logPrintf("changeState: from %d to %d, votedFor: %d, term: %d", rf.state, to, votedFor, term)
+	rf.logPrintf("changeState: from %d to %d, votedFor: %d, term: %d", rf.state, to, votedFor, term)
 
 	select {
 	case rf.resetElectionTimer <- struct{}{}:
@@ -303,11 +310,11 @@ func (rf *Raft) leaderHeart() {
 	timestamp := uint64(time.Now().UnixNano())
 
 	// 组合时间戳和随机数
-	_ = timestamp ^ 0xFFFF // 使用低16位随机数
+	goID := timestamp ^ 0xFFFF // 使用低16位随机数
 	for !rf.killed() {
 		rf.mu.Lock()
 		if rf.state == leader {
-			// rf.logPrintf("send leaderHeart.(%s)", goID)
+			rf.logPrintf("send leaderHeart.(%s)", goID)
 			rf.mu.Unlock()
 			for i := range rf.peers {
 				if i == rf.me {
@@ -331,20 +338,32 @@ func (rf *Raft) leaderHeart() {
 					rf.mu.Lock()
 					defer rf.mu.Unlock()
 					if !reply.Success && reply.Term > rf.currentTerm {
-						// rf.logPrintf("Find a bigger Term: oldTerm:%d newTerm:%d. changeState to follower.", rf.currentTerm, reply.Term)
+						rf.logPrintf("Find a bigger Term: oldTerm:%d newTerm:%d. changeState to follower.", rf.currentTerm, reply.Term)
 						rf.changeState(follower, -1, reply.Term)
 					} else {
 						rf.updateNextIndex(i, reply, heartPacket)
+						// rf.logPrintf("heart has been refused, sync data")
+						// go rf.syncFollower(i)
 					}
 				}()
 			}
 		} else {
-			// rf.logPrintf("not a leader, quit leaderHeart.")
+			rf.logPrintf("not a leader, quit leaderHeart.")
 			rf.mu.Unlock()
 			return
 		}
 		<-time.After(time.Duration(heartTimeOut) * time.Millisecond)
 	}
+}
+
+func (rf *Raft) syncFollower(server int) {
+	wg := sync.WaitGroup{}
+	successful := make(chan struct{}, 1)
+	defer close(successful)
+	wg.Add(1)
+	go rf.sendLog(server, successful, &wg)
+	<-successful
+	wg.Wait()
 }
 
 // return currentTerm and whether this server
@@ -436,19 +455,21 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	// rf.logPrintf("income a requestVote. argTerm:%d,Candidate:%d", args.Term, args.CandidateId)
+	rf.logPrintf("income a requestVote. argTerm:%d,Candidate:%d", args.Term, args.CandidateId)
 	hasVotedForOther := rf.votedFor != -1 && rf.votedFor != args.CandidateId
 	rfLastLog := rf.log.GetLast()
 	upToDateLog := args.LastLogTerm > rfLastLog.Term ||
 		(args.LastLogTerm == rfLastLog.Term && args.LastLogIndex >= rfLastLog.Index)
 	if (args.Term > rf.currentTerm && upToDateLog) || (args.Term == rf.currentTerm && !hasVotedForOther && upToDateLog) {
-		// rf.logPrintf("Vote to :%d", args.CandidateId)
+		rf.logPrintf("Vote to :%d", args.CandidateId)
 		reply.VoteGranted = true
 		reply.Term = args.Term
 		rf.changeState(follower, args.CandidateId, args.Term)
 		return
 	} else {
-		// rf.logPrintf("NOT Vote to :%d", args.CandidateId)
+		rf.logPrintf("NOT Vote to :%d", args.CandidateId)
+		// 即便不投票，也需要更新任期。以促使足够新的节点能够尽快当选
+		rf.currentTerm = max(rf.currentTerm, args.Term)
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
 		return
@@ -490,7 +511,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 func (rf *Raft) election() {
 	getVoteCount := 1
 	rf.mu.Lock()
-	// rf.logPrintf("begin a new election.")
+	rf.logPrintf("begin a new election.")
 	requestVote := &RequestVoteArgs{
 		Term:         rf.currentTerm,
 		CandidateId:  rf.me,
@@ -518,7 +539,7 @@ func (rf *Raft) election() {
 			}
 		}()
 	}
-	for {
+	for !rf.killed() {
 		select {
 		case reply := <-replyChan:
 			rf.mu.Lock()
@@ -526,14 +547,14 @@ func (rf *Raft) election() {
 			if reply.VoteGranted && reply.Term == rf.currentTerm && rf.state == candidate {
 				getVoteCount++
 				if getVoteCount > len(rf.peers)/2 {
-					// rf.logPrintf("Get majority votes")
+					rf.logPrintf("Get majority votes")
 					rf.changeState(leader, -1, rf.currentTerm)
 					rf.mu.Unlock()
 					return
 				}
 			} else {
 				if reply.Term > rf.currentTerm {
-					// rf.logPrintf("Find a bigger Term: oldTerm:%d newTerm:%d. changeState to follower.", rf.currentTerm, reply.Term)
+					rf.logPrintf("Find a bigger Term: oldTerm:%d newTerm:%d. changeState to follower.", rf.currentTerm, reply.Term)
 					rf.changeState(follower, -1, reply.Term)
 					rf.mu.Unlock()
 					return
@@ -600,7 +621,7 @@ func (rf *Raft) commitLog(logIndex int, successReply <-chan struct{}) {
 	majority := len(rf.peers) / 2
 	successCount := 1
 	ticker := time.NewTicker(electionTimeOut * time.Millisecond)
-	for {
+	for !rf.killed() {
 		select {
 		case <-successReply:
 			successCount++
@@ -658,19 +679,24 @@ func (rf *Raft) updateNextIndex(server int, appendEntiresReply AppendEntriesRepl
 		return
 	} else {
 		if appendEntiresReply.XTerm != -1 {
-			isHasTerm := false
+			isHasXTerm := false
 			for i := rf.log.GetLast().Index; i >= rf.log.GetBegin().Index; i-- {
-				if rf.log.Get(i).Term == appendEntiresReply.Term {
+				if rf.log.Get(i).Term == appendEntiresReply.XTerm {
+					rf.logPrintf("(updateNextIndex) rf has term, rf.nextIndex[server] = %d", i+1)
 					rf.nextIndex[server] = i + 1
-					isHasTerm = true
+					isHasXTerm = true
 					break
 				}
 			}
-			if !isHasTerm {
+			if !isHasXTerm {
+				rf.logPrintf("(updateNextIndex) rf does't has term, rf.nextIndex[server] = %d", appendEntiresReply.XIndex)
 				rf.nextIndex[server] = appendEntiresReply.XIndex
 			}
 		} else {
-			rf.nextIndex[server] = rf.log.GetLast().Index - appendEntiresReply.XLen
+			temp := appendEntiresArgs.PrevLogIndex - appendEntiresReply.XLen
+			rf.nextIndex[server] = temp + 1
+			rf.logPrintf("(updateNextIndex) rf has hole, rf.log.GetLast().Index = %d, rf.nextIndex[server] = %d",
+				rf.log.GetLast().Index, rf.log.GetLast().Index-appendEntiresReply.XLen+1)
 		}
 	}
 }
