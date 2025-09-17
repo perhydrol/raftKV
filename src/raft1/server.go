@@ -100,7 +100,7 @@ func (rs *rfsrv) applier(applyCh chan raftapi.ApplyMsg) {
 		if m.CommandValid == false {
 			// ignore other types of ApplyMsg
 		} else {
-			fmt.Printf("[Tester] get a new applyCh: CommandValid:%v, CommandIndex:%d\n", m.CommandValid, m.CommandIndex)
+			// fmt.Printf("[Tester] get a new applyCh: CommandValid:%v, CommandIndex:%d\n", m.CommandValid, m.CommandIndex)
 			err_msg, prevok := rs.ts.checkLogs(rs.me, m)
 			if m.CommandIndex > 1 && prevok == false {
 				err_msg = fmt.Sprintf("server %v apply out of order %v", rs.me, m.CommandIndex)

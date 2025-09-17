@@ -123,21 +123,6 @@ func (l *logList) GetSlice(begin, end int) []Entry {
 	return l.log[begin:end]
 }
 
-// beginIndex 本身也会被删除
-func (l *logList) removeAfter(beginIndex int) {
-	if beginIndex > l.log[len(l.log)-1].Index {
-		return
-	}
-	removeLogBegin := -1
-	for i := l.log[len(l.log)-1].Index; i >= beginIndex; i-- {
-		removeLogBegin = i
-	}
-	l.log = l.log[:removeLogBegin]
-	l.beginIndex = l.log[0].Index
-	l.endIndex = l.log[len(l.log)-1].Index
-	l.Size = len(l.log)
-}
-
 func (rf *Raft) updateTerm(newTerm int) {
 	if newTerm < rf.currentTerm {
 		msg := fmt.Sprintf("ERROR: want to reduce term.(newTerm:%d, oldTerm:%d)", newTerm, rf.currentTerm)
@@ -333,7 +318,8 @@ func (rf *Raft) leaderHeart() {
 					}
 					rf.mu.Unlock()
 					reply := AppendEntriesReply{}
-					for !rf.sendAppendEntries(i, &heartPacket, &reply) {
+					if !rf.sendAppendEntries(i, &heartPacket, &reply) {
+						return
 					}
 					rf.mu.Lock()
 					defer rf.mu.Unlock()
@@ -342,8 +328,6 @@ func (rf *Raft) leaderHeart() {
 						rf.changeState(follower, -1, reply.Term)
 					} else {
 						rf.updateNextIndex(i, reply, heartPacket)
-						// rf.logPrintf("heart has been refused, sync data")
-						// go rf.syncFollower(i)
 					}
 				}()
 			}
@@ -354,16 +338,6 @@ func (rf *Raft) leaderHeart() {
 		}
 		<-time.After(time.Duration(heartTimeOut) * time.Millisecond)
 	}
-}
-
-func (rf *Raft) syncFollower(server int) {
-	wg := sync.WaitGroup{}
-	successful := make(chan struct{}, 1)
-	defer close(successful)
-	wg.Add(1)
-	go rf.sendLog(server, successful, &wg)
-	<-successful
-	wg.Wait()
 }
 
 // return currentTerm and whether this server
@@ -669,13 +643,12 @@ func (rf *Raft) updateNextIndex(server int, appendEntiresReply AppendEntriesRepl
 		server, appendEntiresReply.Term, appendEntiresReply.Success, appendEntiresReply.XTerm, appendEntiresReply.XIndex, appendEntiresReply.XLen)
 	if appendEntiresReply.Success {
 		if len(appendEntiresArgs.Entries) != 0 {
-			rf.nextIndex[server] = appendEntiresArgs.Entries[len(appendEntiresArgs.Entries)-1].Index
+			rf.nextIndex[server] = appendEntiresArgs.Entries[len(appendEntiresArgs.Entries)-1].Index + 1
 		}
 		return
 	}
 	if appendEntiresReply.Term > rf.currentTerm {
 		rf.changeState(follower, -1, appendEntiresReply.Term)
-		rf.mu.Unlock()
 		return
 	} else {
 		if appendEntiresReply.XTerm != -1 {
@@ -709,7 +682,11 @@ func (rf *Raft) sendLog(server int, successReply chan<- struct{}, wg *sync.WaitG
 	for !rf.killed() && isLeader {
 		appendEntriesArgs := rf.genAppendEntriesArgs(server)
 		appendEntiresReply := AppendEntriesReply{}
-		for !rf.sendAppendEntries(server, &appendEntriesArgs, &appendEntiresReply) {
+		if !rf.sendAppendEntries(server, &appendEntriesArgs, &appendEntiresReply) {
+			rf.mu.Lock()
+			isLeader = rf.state == leader
+			rf.mu.Unlock()
+			continue
 		}
 		if appendEntiresReply.Success {
 			successReply <- struct{}{}
