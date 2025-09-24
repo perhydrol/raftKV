@@ -10,7 +10,9 @@ import (
 	//	"bytes"
 
 	"bytes"
+	"encoding/gob"
 	"fmt"
+	"hash/fnv"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -177,6 +179,7 @@ func (rf *Raft) GetAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRe
 	if args.Term > rf.currentTerm {
 		rf.logPrintf("Find a bigger Term: oldTerm:%d newTerm:%d. changeState to follower.", rf.currentTerm, args.Term)
 		reply.Term = args.Term
+		// 进入下一个任期，刷新投票
 		rf.changeState(follower, -1, args.Term)
 		reply.Success = rf.replyAppendEntries(args, reply)
 		return
@@ -191,7 +194,8 @@ func (rf *Raft) GetAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRe
 	}
 	rf.logPrintf("conform AppendEntries RPC")
 	reply.Term = rf.currentTerm
-	rf.changeState(follower, -1, rf.currentTerm)
+	// 任期不变，不允许刷新投票
+	rf.changeState(follower, rf.votedFor, rf.currentTerm)
 	reply.Success = rf.replyAppendEntries(args, reply)
 }
 
@@ -341,6 +345,7 @@ func (rf *Raft) leaderHeart() {
 					defer rf.mu.Unlock()
 					if !reply.Success && reply.Term > rf.currentTerm {
 						rf.logPrintf("Find a bigger Term: oldTerm:%d newTerm:%d. changeState to follower.", rf.currentTerm, reply.Term)
+						// 进入下一个任期，刷新投票
 						rf.changeState(follower, -1, reply.Term)
 					} else {
 						rf.updateNextIndex(i, reply, heartPacket)
@@ -578,13 +583,15 @@ func (rf *Raft) election() {
 				getVoteCount++
 				if getVoteCount > len(rf.peers)/2 {
 					rf.logPrintf("Get majority votes")
-					rf.changeState(leader, -1, rf.currentTerm)
+					// 不允许刷新投票
+					rf.changeState(leader, rf.votedFor, rf.currentTerm)
 					rf.mu.Unlock()
 					return
 				}
 			} else {
 				if reply.Term > rf.currentTerm {
 					rf.logPrintf("Find a bigger Term: oldTerm:%d newTerm:%d. changeState to follower.", rf.currentTerm, reply.Term)
+					// 进入下一个任期，刷新投票
 					rf.changeState(follower, -1, reply.Term)
 					rf.mu.Unlock()
 					return
@@ -595,6 +602,20 @@ func (rf *Raft) election() {
 			return
 		}
 	}
+}
+
+func HashUsingGob(v interface{}) (uint32, error) {
+	var buf bytes.Buffer
+	// 创建 gob encoder
+	enc := gob.NewEncoder(&buf)
+	// 编码值
+	if err := enc.Encode(v); err != nil {
+		return 0, err // 可能因类型不支持而失败
+	}
+	// 使用 FNV-1a 哈希（快速、确定性）
+	h := fnv.New32a()
+	h.Write(buf.Bytes())
+	return h.Sum32(), nil
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -617,7 +638,14 @@ func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) 
 	}
 	term = rf.currentTerm
 	index = rf.log.GetLast().Index + 1
-	rf.logPrintf("get a new entry: index: %d, term: %d, isLeader: %v", index, term, rf.state == leader)
+	if debug {
+		hash, err := HashUsingGob(command)
+		if err != nil {
+			rf.logPrintf("cannot HASH.")
+			hash = 0
+		}
+		rf.logPrintf("get a new entry: index: %d, term: %d, isLeader: %v, hash: %v", index, term, rf.state == leader, hash)
+	}
 	newEntry := []Entry{{Term: term, Index: index, Command: command}}
 	rf.log.Append(newEntry)
 	rf.persist()
@@ -696,7 +724,7 @@ func (rf *Raft) updateNextIndex(server int, appendEntiresReply AppendEntriesRepl
 	if appendEntiresArgs.Term < rf.currentTerm {
 		return
 	}
-	defer rf.logPrintf("update rf.nextIndex[%d]: %d", server, rf.nextIndex[server])
+	defer func() { rf.logPrintf("update rf.nextIndex[%d]: %d", server, rf.nextIndex[server]) }()
 	rf.logPrintf("server:{id: %d, term: %d, success: %v, XTerm: %d, XIndex: %d, XLen: %d}",
 		server, appendEntiresReply.Term, appendEntiresReply.Success, appendEntiresReply.XTerm, appendEntiresReply.XIndex, appendEntiresReply.XLen)
 	if appendEntiresReply.Success {
@@ -706,6 +734,7 @@ func (rf *Raft) updateNextIndex(server int, appendEntiresReply AppendEntriesRepl
 		return
 	}
 	if appendEntiresReply.Term > rf.currentTerm {
+		// 进入下一个任期，刷新投票
 		rf.changeState(follower, -1, appendEntiresReply.Term)
 		return
 	} else {
@@ -755,6 +784,7 @@ func (rf *Raft) sendLog(server int, successReply chan<- struct{}, wg *sync.WaitG
 		} else {
 			rf.mu.Lock()
 			if appendEntiresReply.Term > rf.currentTerm {
+				// 进入下一个任期，刷新投票
 				rf.changeState(follower, -1, appendEntiresReply.Term)
 			} else {
 				rf.updateNextIndex(server, appendEntiresReply, appendEntriesArgs)

@@ -8,16 +8,14 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing as mp
 
 TESTS_3B = [
-    "TestBasicAgree3B",
-    "TestRPCBytes3B",
-    "TestFollowerFailure3B",
-    "TestLeaderFailure3B",
-    "TestFailAgree3B",
-    "TestFailNoAgree3B",
-    "TestConcurrentStarts3B",
-    "TestRejoin3B",
-    "TestBackup3B",
-    "TestCount3B",
+"TestPersist13C",
+"TestPersist23C",
+"TestPersist33C",
+"TestFigure83C",
+"TestUnreliableAgree3C",
+"TestFigure8Unreliable3C",
+"TestReliableChurn3C",
+"TestUnreliableChurn3C",
 ]
 
 LOG_FILE = Path("./log.log")
@@ -33,7 +31,7 @@ def run_test(test_name: str, round_num: int) -> dict:
             cmd,
             capture_output=True,
             text=True,
-            timeout=60,
+            timeout=120,
         )
 
         # 👇 核心逻辑变更：必须 returncode == 0 且 stdout 含 "PASS"
