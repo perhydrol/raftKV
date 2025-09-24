@@ -75,7 +75,8 @@ type Raft struct {
 	resetElectionTimer chan struct{}
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	applyCh chan raftapi.ApplyMsg
+	applyCh   chan raftapi.ApplyMsg
+	heartDict map[int]bool
 }
 
 type logList struct {
@@ -271,6 +272,7 @@ func (rf *Raft) changeState(to nodeState, votedFor int, term int) {
 	default:
 	}
 	rf.votedFor = votedFor
+	rf.heartDict = make(map[int]bool)
 	if to != candidate {
 		rf.updateTerm(term)
 	}
@@ -308,56 +310,58 @@ func (rf *Raft) changeState(to nodeState, votedFor int, term int) {
 func (rf *Raft) leaderHeart() {
 	// 获取当前时间戳（纳秒精度）
 	timestamp := uint64(time.Now().UnixNano())
-
+	ticker := time.NewTicker(time.Duration(heartTimeOut) * time.Millisecond)
+	defer ticker.Stop()
 	// 组合时间戳和随机数
 	goID := timestamp ^ 0xFFFF // 使用低16位随机数
 	for !rf.killed() {
 		rf.mu.Lock()
-		if rf.state == leader {
-			rf.logPrintf("send leaderHeart.(%s)", goID)
-			rf.mu.Unlock()
-			for i := range rf.peers {
-				if i == rf.me {
-					continue
-				}
-				i := i
-				go func() {
-					rf.mu.Lock()
-					heartPacket := AppendEntriesArgs{
-						Term:         rf.currentTerm,
-						LeaderId:     rf.me,
-						PrevLogTerm:  rf.log.Get(rf.nextIndex[i] - 1).Term,
-						PrevLogIndex: rf.log.Get(rf.nextIndex[i] - 1).Index,
-						Entries:      nil,
-						LeaderCommit: rf.commitIndex,
-					}
-					rf.mu.Unlock()
-					reply := AppendEntriesReply{}
-					for !rf.sendAppendEntries(i, &heartPacket, &reply) {
-						rf.mu.Lock()
-						if rf.killed() || rf.state != leader {
-							rf.mu.Unlock()
-							return
-						}
-						rf.mu.Unlock()
-					}
-					rf.mu.Lock()
-					defer rf.mu.Unlock()
-					if !reply.Success && reply.Term > rf.currentTerm {
-						rf.logPrintf("Find a bigger Term: oldTerm:%d newTerm:%d. changeState to follower.", rf.currentTerm, reply.Term)
-						// 进入下一个任期，刷新投票
-						rf.changeState(follower, -1, reply.Term)
-					} else {
-						rf.updateNextIndex(i, reply, heartPacket)
-					}
-				}()
-			}
-		} else {
-			rf.logPrintf("not a leader, quit leaderHeart.")
+		if rf.state != leader {
 			rf.mu.Unlock()
 			return
 		}
-		<-time.After(time.Duration(heartTimeOut) * time.Millisecond)
+		rf.logPrintf("send leaderHeart.(%s)", goID)
+		for i := range rf.peers {
+			if i == rf.me || rf.heartDict[i] {
+				continue
+			}
+			i := i
+			rf.heartDict[i] = true
+			go func() {
+				rf.mu.Lock()
+				heartPacket := AppendEntriesArgs{
+					Term:         rf.currentTerm,
+					LeaderId:     rf.me,
+					PrevLogTerm:  rf.log.Get(rf.nextIndex[i] - 1).Term,
+					PrevLogIndex: rf.log.Get(rf.nextIndex[i] - 1).Index,
+					Entries:      nil,
+					LeaderCommit: rf.commitIndex,
+				}
+				rf.mu.Unlock()
+				reply := AppendEntriesReply{}
+				for !rf.sendAppendEntries(i, &heartPacket, &reply) {
+					rf.mu.Lock()
+					if rf.killed() || rf.state != leader {
+						rf.heartDict[i] = false
+						rf.mu.Unlock()
+						return
+					}
+					rf.mu.Unlock()
+				}
+				rf.mu.Lock()
+				defer rf.mu.Unlock()
+				rf.heartDict[i] = false
+				if !reply.Success && reply.Term > rf.currentTerm {
+					rf.logPrintf("Find a bigger Term: oldTerm:%d newTerm:%d. changeState to follower.", rf.currentTerm, reply.Term)
+					// 进入下一个任期，刷新投票
+					rf.changeState(follower, -1, reply.Term)
+				} else {
+					rf.updateNextIndex(i, reply, heartPacket)
+				}
+			}()
+		}
+		rf.mu.Unlock()
+		<-ticker.C
 	}
 }
 
@@ -687,13 +691,15 @@ func (rf *Raft) commitLog(logIndex int, successReply <-chan struct{}) {
 			if successCount > majority {
 				rf.mu.Lock()
 				defer rf.mu.Unlock()
-				rf.logPrintf("logIndex: %d get majority and commitIndex: %d", logIndex, rf.commitIndex)
-				rf.commitLogBeforIndex(logIndex, rf.currentTerm)
+				if rf.state == leader && !rf.killed() {
+					rf.logPrintf("logIndex: %d get majority and commitIndex: %d", logIndex, rf.commitIndex)
+					rf.commitLogBeforIndex(logIndex, rf.currentTerm)
+				}
 				return
 			}
 		case <-ticker.C:
 			rf.mu.Lock()
-			if rf.state != leader {
+			if rf.killed() || rf.state != leader {
 				rf.logPrintf("not a leader, quit commitLog func")
 				rf.mu.Unlock()
 				return
@@ -706,16 +712,19 @@ func (rf *Raft) commitLog(logIndex int, successReply <-chan struct{}) {
 func (rf *Raft) genAppendEntriesArgs(server int) AppendEntriesArgs {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	rf.logPrintf("gen a new AppendEntriesArgs. rf.nextIndex[%d]: %d", server, rf.nextIndex[server])
-	args := AppendEntriesArgs{
-		Term:         rf.currentTerm,
-		LeaderId:     rf.me,
-		PrevLogIndex: rf.nextIndex[server] - 1,
-		PrevLogTerm:  rf.log.Get(rf.nextIndex[server] - 1).Term,
-		Entries:      nil,
-		LeaderCommit: rf.commitIndex,
+	args := AppendEntriesArgs{}
+	if rf.state == leader {
+		rf.logPrintf("gen a new AppendEntriesArgs. rf.nextIndex[%d]: %d", server, rf.nextIndex[server])
+		args = AppendEntriesArgs{
+			Term:         rf.currentTerm,
+			LeaderId:     rf.me,
+			PrevLogIndex: rf.nextIndex[server] - 1,
+			PrevLogTerm:  rf.log.Get(rf.nextIndex[server] - 1).Term,
+			Entries:      nil,
+			LeaderCommit: rf.commitIndex,
+		}
+		args.Entries = append(args.Entries, rf.log.GetSlice(rf.nextIndex[server], -1)...)
 	}
-	args.Entries = append(args.Entries, rf.log.GetSlice(rf.nextIndex[server], -1)...)
 	return args
 }
 
@@ -783,13 +792,13 @@ func (rf *Raft) sendLog(server int, successReply chan<- struct{}, wg *sync.WaitG
 			return
 		} else {
 			rf.mu.Lock()
+			isLeader = rf.state == leader
 			if appendEntiresReply.Term > rf.currentTerm {
 				// 进入下一个任期，刷新投票
 				rf.changeState(follower, -1, appendEntiresReply.Term)
-			} else {
+			} else if isLeader {
 				rf.updateNextIndex(server, appendEntiresReply, appendEntriesArgs)
 			}
-			isLeader = rf.state == leader
 			rf.mu.Unlock()
 		}
 	}
@@ -876,6 +885,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		electionTimer:      time.NewTimer(time.Duration(rand.Intn(100)) * time.Millisecond),
 		resetElectionTimer: make(chan struct{}, 1),
 		applyCh:            applyCh,
+		heartDict:          make(map[int]bool),
 	}
 	rf.peers = peers
 	rf.persister = persister
