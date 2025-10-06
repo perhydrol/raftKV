@@ -4,3 +4,4 @@ diff.txt
 *.log
 *.prof
 *.test
+src/raft1/raft.go.bk

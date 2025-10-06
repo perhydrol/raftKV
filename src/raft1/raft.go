@@ -71,8 +71,7 @@ type Raft struct {
 
 	state nodeState
 
-	electionTimer      *time.Timer
-	resetElectionTimer chan struct{}
+	electionTimer *time.Timer
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 	applyCh   chan raftapi.ApplyMsg
@@ -127,16 +126,6 @@ func (l *logList) GetSlice(begin, end int) []Entry {
 		return l.Log[begin:]
 	}
 	return l.Log[begin:end]
-}
-
-func (rf *Raft) updateTerm(newTerm int) {
-	if newTerm < rf.currentTerm {
-		msg := fmt.Sprintf("ERROR: want to reduce term.(newTerm:%d, oldTerm:%d)", newTerm, rf.currentTerm)
-		rf.logPrintf(msg)
-		panic(msg)
-	} else {
-		rf.currentTerm = newTerm
-	}
 }
 
 type Entry struct {
@@ -196,7 +185,7 @@ func (rf *Raft) GetAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRe
 	rf.logPrintf("conform AppendEntries RPC")
 	reply.Term = rf.currentTerm
 	// 任期不变，不允许刷新投票
-	rf.changeState(follower, rf.votedFor, rf.currentTerm)
+	rf.resetElection()
 	reply.Success = rf.replyAppendEntries(args, reply)
 }
 
@@ -267,25 +256,20 @@ func (rf *Raft) commitLogBeforIndex(leaderCommit int, leaderTerm int) {
 func (rf *Raft) changeState(to nodeState, votedFor int, term int) {
 	rf.logPrintf("changeState: from %d to %d, votedFor: %d, term: %d", rf.state, to, votedFor, term)
 
-	select {
-	case rf.resetElectionTimer <- struct{}{}:
-	default:
-	}
+	rf.resetElection()
 	rf.votedFor = votedFor
 	rf.heartDict = make(map[int]bool)
-	if to != candidate {
-		rf.updateTerm(term)
+	if term < rf.currentTerm {
+		msg := fmt.Sprintf("ERROR: want to reduce term.(newTerm:%d, oldTerm:%d)", term, rf.currentTerm)
+		rf.logPrintf(msg)
+		panic(msg)
+	} else {
+		rf.currentTerm = term
 	}
 	switch to {
 	case follower:
-		if rf.state != follower {
-			rf.state = follower
-			rf.persist()
-		}
+		rf.state = follower
 	case leader:
-		if rf.state == leader {
-			break
-		}
 		rf.logPrintf("become a leader")
 		rf.state = leader
 		lastLogIndex := rf.log.GetLast().Index
@@ -295,16 +279,13 @@ func (rf *Raft) changeState(to nodeState, votedFor int, term int) {
 		rf.persist()
 		go rf.leaderHeart()
 	case candidate:
-		if rf.state != leader {
-			rf.logPrintf("become a candidate")
-			rf.state = candidate
-			rf.currentTerm++
-			rf.persist()
-			go rf.election()
-		}
+		rf.logPrintf("become a candidate")
+		rf.state = candidate
+		go rf.election()
 	default:
 		panic("Wrong state.")
 	}
+	rf.persist()
 }
 
 func (rf *Raft) leaderHeart() {
@@ -637,7 +618,7 @@ func HashUsingGob(v interface{}) (uint32, error) {
 func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if rf.state != leader {
+	if rf.state != leader || rf.killed() {
 		return -1, -1, false
 	}
 	term = rf.currentTerm
@@ -824,8 +805,9 @@ func (rf *Raft) killed() bool {
 }
 
 func (rf *Raft) resetElection() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	if rf.mu.TryLock() {
+		defer rf.mu.Unlock()
+	}
 	rf.logPrintf("Reset time.")
 	if !rf.electionTimer.Stop() {
 		select {
@@ -846,17 +828,11 @@ func (rf *Raft) ticker() {
 		// milliseconds.
 		select {
 		case <-rf.electionTimer.C:
-			go func() {
-				rf.mu.Lock()
+			rf.mu.Lock()
+			if rf.state != leader {
 				rf.changeState(candidate, rf.me, rf.currentTerm+1)
-				rf.mu.Unlock()
-			}()
-			select {
-			case rf.resetElectionTimer <- struct{}{}:
-			default:
 			}
-		case <-rf.resetElectionTimer:
-			rf.resetElection()
+			rf.mu.Unlock()
 		}
 	}
 }
@@ -873,19 +849,18 @@ func (rf *Raft) ticker() {
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *tester.Persister, applyCh chan raftapi.ApplyMsg) raftapi.Raft {
 	rf := &Raft{
-		mu:                 sync.Mutex{},
-		currentTerm:        0,
-		votedFor:           -1,
-		log:                logList{},
-		commitIndex:        0,
-		lastApplied:        0,
-		nextIndex:          make([]int, len(peers)),
-		matchIndex:         make([]int, len(peers)),
-		state:              follower,
-		electionTimer:      time.NewTimer(time.Duration(rand.Intn(100)) * time.Millisecond),
-		resetElectionTimer: make(chan struct{}, 1),
-		applyCh:            applyCh,
-		heartDict:          make(map[int]bool),
+		mu:            sync.Mutex{},
+		currentTerm:   0,
+		votedFor:      -1,
+		log:           logList{},
+		commitIndex:   0,
+		lastApplied:   0,
+		nextIndex:     make([]int, len(peers)),
+		matchIndex:    make([]int, len(peers)),
+		state:         follower,
+		electionTimer: time.NewTimer(time.Duration(rand.Intn(100)) * time.Millisecond),
+		applyCh:       applyCh,
+		heartDict:     make(map[int]bool),
 	}
 	rf.peers = peers
 	rf.persister = persister
