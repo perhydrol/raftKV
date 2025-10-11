@@ -44,8 +44,8 @@ func (rf *Raft) logPrintf(format string, a ...interface{}) {
 	if !debug {
 		return
 	} else {
-		newFormat := fmt.Sprintf("[%s] Id:%d Term:%d State:%d lastLogIndex:%d commitIndex:%d: %s\n",
-			time.Now(), rf.me, rf.currentTerm, rf.state, rf.log.EndIndex, rf.commitIndex, format)
+		newFormat := fmt.Sprintf("[%s] Id:%d Term:%d State:%d lastLogIndex:%d lastLogTerm:%d commitIndex:%d: %s\n",
+			time.Now(), rf.me, rf.currentTerm, rf.state, rf.log.EndIndex, rf.log.GetLast().Term, rf.commitIndex, format)
 		fmt.Printf(newFormat, a...)
 	}
 }
@@ -288,57 +288,60 @@ func (rf *Raft) changeState(to nodeState, votedFor int, term int) {
 }
 
 func (rf *Raft) leaderHeart() {
-	if debug {
-		defer func() {
-			rf.mu.Lock()
-			rf.logPrintf("quit heart.")
+	// 获取当前时间戳（纳秒精度）
+	timestamp := uint64(time.Now().UnixNano())
+	ticker := time.NewTicker(time.Duration(heartTimeOut) * time.Millisecond)
+	defer ticker.Stop()
+	// 组合时间戳和随机数
+	goID := timestamp ^ 0xFFFF // 使用低16位随机数
+	for !rf.killed() {
+		rf.mu.Lock()
+		if rf.state != leader {
 			rf.mu.Unlock()
-		}()
-	}
-	for i := range rf.peers {
-		if i == rf.me {
-			continue
+			return
 		}
-		go func(server int) {
-			for !rf.killed() {
+		rf.logPrintf("send leaderHeart.(%s)", goID)
+		for i := range rf.peers {
+			if i == rf.me {
+				continue
+			}
+			i := i
+			go func() {
+				starTime := time.Now()
 				rf.mu.Lock()
-				if rf.state != leader {
-					rf.mu.Unlock()
-					return
-				}
 				heartPacket := AppendEntriesArgs{
 					Term:         rf.currentTerm,
 					LeaderId:     rf.me,
-					PrevLogTerm:  rf.log.Get(rf.nextIndex[server] - 1).Term,
-					PrevLogIndex: rf.log.Get(rf.nextIndex[server] - 1).Index,
+					PrevLogTerm:  rf.log.Get(rf.nextIndex[i] - 1).Term,
+					PrevLogIndex: rf.log.Get(rf.nextIndex[i] - 1).Index,
 					Entries:      nil,
 					LeaderCommit: rf.commitIndex,
 				}
-				rf.logPrintf("heart LeaderCommit: %d.", heartPacket.LeaderCommit)
 				rf.mu.Unlock()
 				reply := AppendEntriesReply{}
-				for !rf.sendAppendEntries(server, &heartPacket, &reply) {
+				for !rf.sendAppendEntries(i, &heartPacket, &reply) {
 					rf.mu.Lock()
-					if rf.killed() || rf.state != leader {
+					if rf.killed() ||
+						rf.state != leader ||
+						time.Now().After(starTime.Add(heartTimeOut*2*time.Millisecond)) {
 						rf.mu.Unlock()
 						return
 					}
 					rf.mu.Unlock()
 				}
 				rf.mu.Lock()
+				defer rf.mu.Unlock()
 				if !reply.Success && reply.Term > rf.currentTerm {
 					rf.logPrintf("Find a bigger Term: oldTerm:%d newTerm:%d. changeState to follower.", rf.currentTerm, reply.Term)
 					// 进入下一个任期，刷新投票
 					rf.changeState(follower, -1, reply.Term)
-					rf.mu.Unlock()
-					return
 				} else {
-					rf.updateNextIndex(server, reply, heartPacket)
+					rf.updateNextIndex(i, reply, heartPacket)
 				}
-				rf.mu.Unlock()
-				<-time.After(heartTimeOut * time.Millisecond)
-			}
-		}(i)
+			}()
+		}
+		rf.mu.Unlock()
+		<-ticker.C
 	}
 }
 
@@ -487,7 +490,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		// 即便不投票，也需要更新任期。以促使足够新的节点能够尽快当选
 		reply.VoteGranted = false
 		if args.Term > rf.currentTerm {
-			rf.changeState(follower, -1, args.Term)
+			rf.currentTerm = args.Term
 		}
 		reply.Term = args.Term
 		return
@@ -627,7 +630,8 @@ func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) 
 			rf.logPrintf("cannot HASH.")
 			hash = 0
 		}
-		rf.logPrintf("get a new entry: index: %d, term: %d, isLeader: %v, hash: %v", index, term, rf.state == leader, hash)
+		rf.logPrintf("get a new entry: index: %d, term: %d, isLeader: %v, hash: %v",
+			index, term, rf.state == leader, hash)
 	}
 	newEntry := []Entry{{Term: term, Index: index, Command: command}}
 	rf.log.Append(newEntry)
@@ -738,7 +742,7 @@ sendLogMainLoop:
 		var reply AppendEntriesReply
 		for !rf.sendAppendEntries(server, &appendEntriesArgs, &reply) {
 			rf.mu.Lock()
-			if rf.state != leader {
+			if rf.state != leader || rf.killed() {
 				rf.mu.Unlock()
 				continue sendLogMainLoop
 			}
@@ -795,7 +799,7 @@ func (rf *Raft) resetElection() {
 		default:
 		}
 	}
-	rf.electionTimer.Reset(time.Duration(electionTimeOut+rand.Intn(100)) * time.Millisecond)
+	rf.electionTimer.Reset(time.Duration(electionTimeOut+rand.Intn(200)) * time.Millisecond)
 }
 
 func (rf *Raft) ticker() {
@@ -808,6 +812,9 @@ func (rf *Raft) ticker() {
 		// milliseconds.
 		select {
 		case <-rf.electionTimer.C:
+			if rf.killed() {
+				return
+			}
 			rf.mu.Lock()
 			if rf.state != leader {
 				rf.changeState(candidate, rf.me, rf.currentTerm+1)
@@ -860,6 +867,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			rf.nextIndex[i] = 1
 		}
 	}
+	rf.resetElection()
 	// initialize from state persisted before a crash
 	rf.logPrintf("Init.")
 	// start ticker goroutine to start elections
