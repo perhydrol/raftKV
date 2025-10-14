@@ -10,9 +10,7 @@ import (
 	//	"bytes"
 
 	"bytes"
-	"encoding/gob"
 	"fmt"
-	"hash/fnv"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -44,8 +42,19 @@ func (rf *Raft) logPrintf(format string, a ...interface{}) {
 	if !debug {
 		return
 	} else {
-		newFormat := fmt.Sprintf("[%s] Id:%d Term:%d State:%d lastLogIndex:%d lastLogTerm:%d commitIndex:%d: %s\n",
-			time.Now(), rf.me, rf.currentTerm, rf.state, rf.log.EndIndex, rf.log.GetLast().Term, rf.commitIndex, format)
+		// Convert state number to readable string
+		stateStr := "UNKNOWN"
+		switch rf.state {
+		case leader:
+			stateStr = "LEADER"
+		case follower:
+			stateStr = "FOLLOWER"
+		case candidate:
+			stateStr = "CANDIDATE"
+		}
+
+		newFormat := fmt.Sprintf("[%s] Server-%d | Term:%d | State:%s | LastLogIdx:%d | LastLogTerm:%d | CommitIdx:%d | %s\n",
+			time.Now().Format("15:04:05.000"), rf.me, rf.currentTerm, stateStr, rf.log.EndIndex, rf.log.GetLast().Term, rf.commitIndex, format)
 		fmt.Printf(newFormat, a...)
 	}
 }
@@ -159,15 +168,16 @@ func (rf *Raft) sendAppendEntries(peer int, args *AppendEntriesArgs, reply *Appe
 func (rf *Raft) GetAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	rf.logPrintf("get a AppendEntries RPC. leader:%d, Term:%d, PrevLogIndex:%d, PrevLogTerm:%d.", args.LeaderId, args.Term, args.PrevLogIndex, args.PrevLogTerm)
+	rf.logPrintf("RECV AppendEntries from S%d [Term:%d PrevLogIdx:%d PrevLogTerm:%d EntriesCount:%d LeaderCommit:%d]",
+		args.LeaderId, args.Term, args.PrevLogIndex, args.PrevLogTerm, len(args.Entries), args.LeaderCommit)
 	if args.Term < rf.currentTerm {
-		rf.logPrintf("refuse becouse rpc's term < rf.Term")
+		rf.logPrintf("REJECT AppendEntries: stale term (leader T%d < local T%d)", args.Term, rf.currentTerm)
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
 	}
 	if args.Term > rf.currentTerm {
-		rf.logPrintf("Find a bigger Term: oldTerm:%d newTerm:%d. changeState to follower.", rf.currentTerm, args.Term)
+		rf.logPrintf("TERM UPDATE: T%d → T%d (from S%d) - converting to follower", rf.currentTerm, args.Term, args.LeaderId)
 		reply.Term = args.Term
 		// 进入下一个任期，刷新投票
 		rf.changeState(follower, -1, args.Term)
@@ -178,13 +188,14 @@ func (rf *Raft) GetAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRe
 	refuse := args.PrevLogIndex > rf.log.GetLast().Index ||
 		args.PrevLogTerm != rf.log.Get(args.PrevLogIndex).Term
 	if refuse {
-		rf.logPrintf("refuse AppendEntries RPC: rf.log.GetLast().Index: %d, rf.log.GetLast().Term: %d", rf.log.GetLast().Index, rf.log.GetLast().Term)
+		rf.logPrintf("REJECT AppendEntries: log mismatch [PrevLogIdx:%d PrevLogTerm:%d] local:[LastIdx:%d LastTerm:%d]",
+			args.PrevLogIndex, args.PrevLogTerm, rf.log.GetLast().Index, rf.log.GetLast().Term)
 		reply.Term = rf.currentTerm
 		reply.Success = rf.replyAppendEntries(args, reply)
 		rf.resetElection() // 当前leader存活，只是日志不匹配，应该要重置记时器
 		return
 	}
-	rf.logPrintf("conform AppendEntries RPC")
+	rf.logPrintf("ACCEPT AppendEntries from S%d [Term:%d EntriesCount:%d]", args.LeaderId, args.Term, len(args.Entries))
 	reply.Term = rf.currentTerm
 	// 任期不变，不允许刷新投票
 	rf.resetElection()
@@ -228,7 +239,7 @@ func (rf *Raft) replyAppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 
 func (rf *Raft) commitLogBeforIndex(leaderCommit int, leaderTerm int) {
 	if leaderCommit <= rf.commitIndex {
-		rf.logPrintf("Waring: rf.commitIndex: %d ~ leaderCommit: %d commited and logSize: %d", rf.commitIndex, leaderCommit, rf.log.Size)
+		rf.logPrintf("COMMIT: already committed up to %d, leaderCommit %d. No new commits.", rf.commitIndex, leaderCommit)
 		return
 	}
 	isHasLeaderTermLog := false
@@ -243,7 +254,7 @@ func (rf *Raft) commitLogBeforIndex(leaderCommit int, leaderTerm int) {
 		// rf.logPrintf("The log has not been synchronized with the leader, so submission is not allowed.")
 		return
 	}
-	rf.logPrintf("index begin: %d ~ end: %d commited and logSize: %d", rf.commitIndex, leaderCommit, rf.log.Size)
+	rf.logPrintf("COMMIT: committing entries from index %d to %d (leaderCommit: %d)", rf.commitIndex, leaderCommit, leaderCommit)
 	for i := rf.commitIndex; i <= leaderCommit && i <= rf.log.GetLast().Index; i++ {
 		if i == 0 {
 			continue
@@ -302,8 +313,11 @@ func (rf *Raft) leaderHeart() {
 			return
 		}
 		rf.logPrintf("send leaderHeart.(%s)", goID)
-		for i := range rf.peers {
-			if i == rf.me {
+		peers_i := len(rf.peers)
+		me := rf.me
+		rf.mu.Unlock()
+		for i := range peers_i {
+			if i == me {
 				continue
 			}
 			i := i
@@ -342,7 +356,6 @@ func (rf *Raft) leaderHeart() {
 				}
 			}()
 		}
-		rf.mu.Unlock()
 		<-ticker.C
 	}
 }
@@ -386,14 +399,11 @@ func (rf *Raft) persist() {
 		CommitIndex: rf.commitIndex,
 		Log:         rf.log,
 	}
-	rf.logPrintf("the log will be persisted (EndIndex: %d, BeginIndex: %d, Size: %d)", rf.log.EndIndex, rf.log.BeginIndex, rf.log.Size)
+	rf.logPrintf("PERSIST: state saved (Log EndIdx:%d, BeginIdx:%d, Size:%d)", rf.log.EndIndex, rf.log.BeginIndex, rf.log.Size)
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	if err := e.Encode(data); err != nil {
-		rf.mu.Lock()
-		rf.logPrintf("persist failed: %v", err)
-		rf.mu.Unlock()
-		panic(err)
+		rf.logPrintf("PERSIST FAILED: encoding error: %v", err)
 	}
 	raftstate := w.Bytes()
 	rf.persister.Save(raftstate, nil)
@@ -410,14 +420,14 @@ func (rf *Raft) readPersist(data []byte) {
 	defer rf.mu.Unlock()
 	pdata := persistData{}
 	if err := d.Decode(&pdata); err != nil {
-		rf.logPrintf(err.Error())
+		rf.logPrintf("READ PERSIST ERROR: %v", err)
 		panic(err)
 	} else {
 		rf.currentTerm = pdata.CurrentTerm
 		rf.votedFor = pdata.VotedFor
 		rf.log = pdata.Log
 		// rf.commitIndex = pdata.CommitIndex
-		rf.logPrintf("readPersist and recover")
+		rf.logPrintf("READ PERSIST: state recovered (Term:%d, VotedFor:%d, Log EndIdx:%d)", rf.currentTerm, rf.votedFor, rf.log.EndIndex)
 	}
 	// Your code here (3C).
 	// Example:
@@ -606,20 +616,6 @@ func (rf *Raft) election() {
 	}
 }
 
-func HashUsingGob(v interface{}) (uint32, error) {
-	var buf bytes.Buffer
-	// 创建 gob encoder
-	enc := gob.NewEncoder(&buf)
-	// 编码值
-	if err := enc.Encode(v); err != nil {
-		return 0, err // 可能因类型不支持而失败
-	}
-	// 使用 FNV-1a 哈希（快速、确定性）
-	h := fnv.New32a()
-	h.Write(buf.Bytes())
-	return h.Sum32(), nil
-}
-
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
 // server isn't the leader, returns false. otherwise start the
@@ -641,13 +637,8 @@ func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) 
 	term = rf.currentTerm
 	index = rf.log.GetLast().Index + 1
 	if debug {
-		hash, err := HashUsingGob(command)
-		if err != nil {
-			rf.logPrintf("cannot HASH.")
-			hash = 0
-		}
-		rf.logPrintf("get a new entry: index: %d, term: %d, isLeader: %v, hash: %v",
-			index, term, rf.state == leader, hash)
+		rf.logPrintf("get a new entry: index: %d, term: %d, isLeader: %v",
+			index, term, rf.state == leader)
 	}
 	newEntry := []Entry{{Term: term, Index: index, Command: command}}
 	rf.log.Append(newEntry)
