@@ -28,7 +28,7 @@ import (
 const debug = true
 
 const (
-	electionTimeOut = 300
+	electionTimeOut = 200
 	heartTimeOut    = 50
 )
 
@@ -171,6 +171,7 @@ func (rf *Raft) GetAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRe
 		reply.Term = args.Term
 		// 进入下一个任期，刷新投票
 		rf.changeState(follower, -1, args.Term)
+		rf.resetElection()
 		reply.Success = rf.replyAppendEntries(args, reply)
 		return
 	}
@@ -180,6 +181,7 @@ func (rf *Raft) GetAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRe
 		rf.logPrintf("refuse AppendEntries RPC: rf.log.GetLast().Index: %d, rf.log.GetLast().Term: %d", rf.log.GetLast().Index, rf.log.GetLast().Term)
 		reply.Term = rf.currentTerm
 		reply.Success = rf.replyAppendEntries(args, reply)
+		rf.resetElection() // 当前leader存活，只是日志不匹配，应该要重置记时器
 		return
 	}
 	rf.logPrintf("conform AppendEntries RPC")
@@ -256,7 +258,6 @@ func (rf *Raft) commitLogBeforIndex(leaderCommit int, leaderTerm int) {
 func (rf *Raft) changeState(to nodeState, votedFor int, term int) {
 	rf.logPrintf("changeState: from %d to %d, votedFor: %d, term: %d", rf.state, to, votedFor, term)
 
-	rf.resetElection()
 	rf.votedFor = votedFor
 	if term < rf.currentTerm {
 		msg := fmt.Sprintf("ERROR: want to reduce term.(newTerm:%d, oldTerm:%d)", term, rf.currentTerm)
@@ -335,6 +336,7 @@ func (rf *Raft) leaderHeart() {
 					rf.logPrintf("Find a bigger Term: oldTerm:%d newTerm:%d. changeState to follower.", rf.currentTerm, reply.Term)
 					// 进入下一个任期，刷新投票
 					rf.changeState(follower, -1, reply.Term)
+					rf.resetElection()
 				} else {
 					rf.updateNextIndex(i, reply, heartPacket)
 				}
@@ -475,6 +477,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	rf.logPrintf("income a requestVote. argTerm:%d,Candidate:%d", args.Term, args.CandidateId)
+	if args.Term == rf.currentTerm && rf.votedFor == args.CandidateId {
+		reply.VoteGranted = true
+		reply.Term = args.Term
+		return
+	}
 	hasVotedForOther := rf.votedFor != -1 && rf.votedFor != args.CandidateId
 	rfLastLog := rf.log.GetLast()
 	upToDateLog := args.LastLogTerm > rfLastLog.Term ||
@@ -484,13 +491,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = true
 		reply.Term = args.Term
 		rf.changeState(follower, args.CandidateId, args.Term)
+		rf.resetElection()
 		return
 	} else {
 		rf.logPrintf("NOT Vote to :%d", args.CandidateId)
 		// 即便不投票，也需要更新任期。以促使足够新的节点能够尽快当选
 		reply.VoteGranted = false
 		if args.Term > rf.currentTerm {
-			rf.currentTerm = args.Term
+			rf.changeState(follower, -1, args.Term) // 虽然不投票,但需要转为follower
 		}
 		reply.Term = args.Term
 		return
@@ -533,6 +541,7 @@ func (rf *Raft) election() {
 	getVoteCount := 1
 	rf.mu.Lock()
 	rf.logPrintf("begin a new election.")
+	beginTerm := rf.currentTerm
 	requestVote := &RequestVoteArgs{
 		Term:         rf.currentTerm,
 		CandidateId:  rf.me,
@@ -555,9 +564,9 @@ func (rf *Raft) election() {
 		go func() {
 			defer wg.Done()
 			reply := &RequestVoteReply{}
-			if ok := rf.sendRequestVote(i, requestVote, reply); ok {
-				replyChan <- reply
+			for !rf.sendRequestVote(i, requestVote, reply) && !rf.killed() {
 			}
+			replyChan <- reply
 		}()
 	}
 	for !rf.killed() {
@@ -571,6 +580,7 @@ func (rf *Raft) election() {
 					rf.logPrintf("Get majority votes")
 					// 不允许刷新投票
 					rf.changeState(leader, rf.votedFor, rf.currentTerm)
+					rf.resetElection()
 					rf.mu.Unlock()
 					return
 				}
@@ -579,13 +589,19 @@ func (rf *Raft) election() {
 					rf.logPrintf("Find a bigger Term: oldTerm:%d newTerm:%d. changeState to follower.", rf.currentTerm, reply.Term)
 					// 进入下一个任期，刷新投票
 					rf.changeState(follower, -1, reply.Term)
+					rf.resetElection()
 					rf.mu.Unlock()
 					return
 				}
 			}
 			rf.mu.Unlock()
 		case <-time.After(time.Duration(electionTimeOut) * time.Millisecond):
-			return
+			rf.mu.Lock()
+			if rf.state != candidate || rf.currentTerm != beginTerm {
+				rf.mu.Unlock()
+				return
+			}
+			rf.mu.Unlock()
 		}
 	}
 }
@@ -757,6 +773,7 @@ sendLogMainLoop:
 		} else {
 			if reply.Term > rf.currentTerm {
 				rf.changeState(follower, -1, reply.Term)
+				rf.resetElection()
 				rf.mu.Unlock()
 				continue
 			}
@@ -789,9 +806,6 @@ func (rf *Raft) killed() bool {
 }
 
 func (rf *Raft) resetElection() {
-	if rf.mu.TryLock() {
-		defer rf.mu.Unlock()
-	}
 	rf.logPrintf("Reset time.")
 	if !rf.electionTimer.Stop() {
 		select {
@@ -819,6 +833,7 @@ func (rf *Raft) ticker() {
 			if rf.state != leader {
 				rf.changeState(candidate, rf.me, rf.currentTerm+1)
 			}
+			rf.resetElection()
 			rf.mu.Unlock()
 		}
 	}

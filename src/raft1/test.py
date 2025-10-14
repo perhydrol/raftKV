@@ -103,7 +103,7 @@ if __name__ == "__main__":
         "TestUnreliableChurn3C",
     ]
 
-    TOTAL_TIMES = 10
+    TOTAL_TIMES = 50
     LOG_DIR = "./test_logs"
 
     print(f"🚀 Starting {len(TESTS)} tests in parallel, each running {TOTAL_TIMES} times.")
