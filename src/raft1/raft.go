@@ -184,10 +184,12 @@ func (l *logList) GetBegin() Entry {
 }
 
 func (l *logList) GetSlice(begin, end int) []Entry {
+	beginOffset := begin - l.BeginIndex
 	if end == -1 {
-		return l.Log[begin:]
+		return l.Log[beginOffset:]
 	}
-	return l.Log[begin:end]
+	endOffset := end - l.BeginIndex
+	return l.Log[beginOffset:endOffset]
 }
 
 type Entry struct {
@@ -446,7 +448,7 @@ func (rf *Raft) persist() {
 
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
-	if len(data) < 1 { // bootstrap without any state?
+	if len(data) < 1 {
 		return
 	}
 	r := bytes.NewBuffer(data)
@@ -465,18 +467,6 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.logPrintf("READ PERSIST: state recovered (Term:%d, VotedFor:%d, Log EndIdx:%d)", rf.currentTerm, rf.votedFor, rf.log.EndIndex)
 	}
 	// Your code here (3C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
 }
 
 // how many bytes in Raft's persisted log?
