@@ -103,9 +103,8 @@ func (rf *Raft) isLock() bool {
 }
 
 type logList struct {
-	EndIndex   int
-	BeginIndex int
-	Size       int
+	EndIndex int
+	Size     int
 
 	LastIncludedIndex int
 	LastIncludedTerm  int
@@ -113,33 +112,61 @@ type logList struct {
 	Snapshot          []byte
 }
 
+func (l *logList) GetBeginIndex() int {
+	if len(l.Log) == 0 {
+		if l.Snapshot == nil {
+			panic(fmt.Errorf("Try to get Begin but log and snapshot are all empty"))
+		}
+		return l.LastIncludedIndex + 1
+	}
+	return l.Log[0].Index
+}
+
 func (l *logList) InstallSnapshot(index int, term int, snapshot []byte) {
+	if index <= l.LastIncludedIndex {
+		return
+	}
 	l.LastIncludedIndex = index
 	l.LastIncludedTerm = term
-
-	keepOffset := -1
-	newBegin := index + 1
-	if newBegin <= l.EndIndex {
-		offset := index - l.BeginIndex
-		if offset < len(l.Log) && offset > 0 {
-			if l.Log[offset].Term == term {
-				keepOffset = offset
-			}
-		}
+	if len(l.Log) == 0 {
+		l.EndIndex = index
+		l.Size = 0
+		l.Snapshot = snapshot
+		return
 	}
 
-	if keepOffset != -1 {
+	newBegin := index + 1
+	keepOffset := newBegin - l.Log[0].Index
+
+	if keepOffset < len(l.Log) && keepOffset > 0 {
 		l.Log = l.Log[keepOffset:]
 	} else {
 		l.Log = l.Log[:0]
 	}
 
-	l.BeginIndex = newBegin
 	if len(l.Log) == 0 {
-		l.EndIndex = l.BeginIndex
+		l.EndIndex = l.LastIncludedIndex
+	} else {
+		l.EndIndex = l.Log[len(l.Log)-1].Index
 	}
 	l.Size = len(l.Log)
 	l.Snapshot = snapshot
+}
+
+func (l *logList) GetIndexTerm(index int) int {
+	if index < l.LastIncludedIndex || index > l.EndIndex {
+		panic(fmt.Sprintf("logIndex %d is not within snapshotted area (< LastIncludedIndex %d)",
+			index, l.LastIncludedIndex))
+	}
+	if index == l.LastIncludedIndex && l.Snapshot != nil {
+		return l.LastIncludedTerm
+	}
+	offset := index - l.Log[0].Index
+	if offset < 0 || offset >= len(l.Log) {
+		panic(fmt.Sprintf("internal error: offset %d (index %d) out of array bounds [0:%d]",
+			offset, index, len(l.Log)))
+	}
+	return l.Log[offset].Term
 }
 
 func (l *logList) Get(logIndex int) Entry {
@@ -147,48 +174,64 @@ func (l *logList) Get(logIndex int) Entry {
 		return Entry{
 			Term:    l.LastIncludedTerm,
 			Index:   l.LastIncludedIndex,
-			Command: l.Snapshot,
+			Command: nil,
 		}
 	}
-	if (logIndex - l.BeginIndex) < 0 {
-		msg := fmt.Sprintf("logIndex: %d, l.BeginIndex: %d\n", logIndex, l.BeginIndex)
+	if (logIndex - l.Log[0].Index) < 0 {
+		msg := fmt.Sprintf("logIndex: %d, l.BeginIndex: %d\n", logIndex, l.Log[0].Index)
 		fmt.Println(msg)
 		panic(msg)
 	}
-	return l.Log[logIndex-l.BeginIndex]
+	return l.Log[logIndex-l.Log[0].Index]
 }
 
 func (l *logList) Append(logs []Entry) {
 	l.Log = append(l.Log, logs...)
-	l.BeginIndex = l.Log[0].Index
 	l.EndIndex = l.Log[len(l.Log)-1].Index
 	l.Size = len(l.Log)
 }
 
 func (l *logList) AppendList(target int, logs []Entry) error {
-	offset := target - l.BeginIndex
-	if offset < 0 || offset > l.Size {
-		return fmt.Errorf("target index: %d out of range[%d:%d]", target, l.BeginIndex, l.EndIndex)
+	if target <= l.LastIncludedIndex {
+		return fmt.Errorf("truncate index %d is within snapshotted area (<= %d)", target, l.LastIncludedIndex)
 	}
-	l.Log = l.Log[:target]
+	offset := target - l.Log[0].Index
+	if offset < 0 || offset > l.Size {
+		return fmt.Errorf("truncate offset %d (index %d) out of array bounds [0:%d]", offset, target, len(l.Log))
+	}
+	l.Log = l.Log[:offset]
 	l.Append(logs)
 	return nil
 }
 
 func (l *logList) GetLast() Entry {
+	if len(l.Log) == 0 && l.Snapshot != nil {
+		return Entry{
+			Term:    l.LastIncludedTerm,
+			Index:   l.LastIncludedIndex,
+			Command: nil,
+		}
+	}
 	return l.Log[len(l.Log)-1]
 }
 
 func (l *logList) GetBegin() Entry {
+	if l.Snapshot != nil {
+		return Entry{
+			Term:    l.LastIncludedTerm,
+			Index:   l.LastIncludedIndex,
+			Command: nil,
+		}
+	}
 	return l.Log[0]
 }
 
 func (l *logList) GetSlice(begin, end int) []Entry {
-	beginOffset := begin - l.BeginIndex
+	beginOffset := begin - l.Log[0].Index
 	if end == -1 {
 		return l.Log[beginOffset:]
 	}
-	endOffset := end - l.BeginIndex
+	endOffset := end - l.Log[0].Index
 	return l.Log[beginOffset:endOffset]
 }
 
@@ -249,18 +292,18 @@ func (rf *Raft) GetAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRe
 	}
 
 	// PrevLogIndex 在范围内，再检查 Term
-	if args.PrevLogTerm != rf.log.Get(args.PrevLogIndex).Term {
+	if args.PrevLogTerm != rf.log.GetIndexTerm(args.PrevLogIndex) {
 		rf.logPrintf("REJECT AppendEntries: log mismatch at index %d (leader term: %d, local term: %d)",
-			args.PrevLogIndex, args.PrevLogTerm, rf.log.Get(args.PrevLogIndex).Term)
+			args.PrevLogIndex, args.PrevLogTerm, rf.log.GetIndexTerm(args.PrevLogIndex))
 
 		reply.Term = rf.currentTerm
 		reply.Success = false
 
 		// 优化：快速回退
 		// 找到冲突任期的第一个日志条目的索引
-		reply.XTerm = rf.log.Get(args.PrevLogIndex).Term
+		reply.XTerm = rf.log.GetIndexTerm(args.PrevLogIndex)
 		firstIndexOfTerm := args.PrevLogIndex
-		for firstIndexOfTerm > rf.log.GetBegin().Index && rf.log.Get(firstIndexOfTerm-1).Term == reply.XTerm {
+		for firstIndexOfTerm > rf.log.GetBegin().Index && rf.log.GetIndexTerm(firstIndexOfTerm-1) == reply.XTerm {
 			firstIndexOfTerm--
 		}
 		reply.XIndex = firstIndexOfTerm
@@ -364,8 +407,8 @@ func (rf *Raft) leaderHeart() {
 				heartPacket := AppendEntriesArgs{
 					Term:         rf.currentTerm,
 					LeaderId:     rf.me,
-					PrevLogTerm:  rf.log.Get(rf.nextIndex[i] - 1).Term,
-					PrevLogIndex: rf.log.Get(rf.nextIndex[i] - 1).Index,
+					PrevLogTerm:  rf.log.GetIndexTerm(rf.nextIndex[i] - 1),
+					PrevLogIndex: rf.nextIndex[i] - 1,
 					Entries:      nil,
 					LeaderCommit: rf.commitIndex,
 				}
@@ -436,7 +479,7 @@ func (rf *Raft) persist() {
 		CommitIndex: rf.commitIndex,
 		Log:         rf.log,
 	}
-	rf.logPrintf("PERSIST: state saved (Log EndIdx:%d, BeginIdx:%d, Size:%d)", rf.log.EndIndex, rf.log.BeginIndex, rf.log.Size)
+	rf.logPrintf("PERSIST: state saved (Log EndIdx:%d, BeginIdx:%d, Size:%d)", rf.log.EndIndex, rf.log.GetBeginIndex(), rf.log.Size)
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	if err := e.Encode(data); err != nil {
@@ -489,7 +532,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		return
 	}
 	rf.logPrintf("Snapshot index:%d is valid", index)
-	rf.log.InstallSnapshot(index, rf.log.Get(index).Term, snapshot)
+	rf.log.InstallSnapshot(index, rf.log.GetIndexTerm(index), snapshot)
 	rf.persist()
 }
 
@@ -692,7 +735,7 @@ func (rf *Raft) commitLog(successReply <-chan int) {
 			if waitCommit[ItemIndex]+1 > majority {
 				rf.lock()
 				if rf.state == leader && !rf.killed() {
-					if rf.log.Get(ItemIndex).Term == rf.currentTerm {
+					if rf.log.GetIndexTerm(ItemIndex) == rf.currentTerm {
 						rf.commitLogBeforeIndex(ItemIndex)
 						rf.logPrintf("logIndex: %d get majority and commitIndex: %d", ItemIndex, rf.commitIndex)
 					}
@@ -712,7 +755,7 @@ func (rf *Raft) genAppendEntriesArgs(server int) AppendEntriesArgs {
 			Term:         rf.currentTerm,
 			LeaderId:     rf.me,
 			PrevLogIndex: rf.nextIndex[server] - 1,
-			PrevLogTerm:  rf.log.Get(rf.nextIndex[server] - 1).Term,
+			PrevLogTerm:  rf.log.GetIndexTerm(rf.nextIndex[server] - 1),
 			Entries:      nil,
 			LeaderCommit: rf.commitIndex,
 		}
@@ -746,7 +789,7 @@ func (rf *Raft) updateNextIndex(server int, appendEntriesReply AppendEntriesRepl
 		// 1. Leader 查找自己日志中最后一个 XTerm 出现的索引 (lastXTermIndex)
 		lastXTermIndex := -1
 		for i := rf.log.GetLast().Index; i >= rf.log.GetBegin().Index; i-- {
-			if rf.log.Get(i).Term == appendEntriesReply.XTerm {
+			if rf.log.GetIndexTerm(i) == appendEntriesReply.XTerm {
 				lastXTermIndex = i
 				break // 找到最后一个匹配的条目
 			}
