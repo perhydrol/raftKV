@@ -123,9 +123,9 @@ func (l *logList) GetBeginIndex() int {
 	return l.Log[0].Index
 }
 
-func (l *logList) InstallSnapshot(index int, term int, snapshot []byte) {
+func (l *logList) InstallSnapshot(index int, term int, snapshot []byte) bool {
 	if index <= l.LastIncludedIndex {
-		return
+		return false
 	}
 	l.LastIncludedIndex = index
 	l.LastIncludedTerm = term
@@ -133,7 +133,7 @@ func (l *logList) InstallSnapshot(index int, term int, snapshot []byte) {
 		l.EndIndex = index
 		l.Size = 0
 		l.Snapshot = snapshot
-		return
+		return true
 	}
 
 	newBegin := index + 1
@@ -152,6 +152,7 @@ func (l *logList) InstallSnapshot(index int, term int, snapshot []byte) {
 	}
 	l.Size = len(l.Log)
 	l.Snapshot = snapshot
+	return true
 }
 
 func (l *logList) GetIndexTerm(index int) int {
@@ -257,6 +258,50 @@ type AppendEntriesReply struct {
 	XTerm   int // term of conficting entry
 	XIndex  int // index of first conficting entry or XTerm
 	XLen    int // length of loss logs
+}
+
+type InstallSnapshotArgs struct {
+	LeaderId          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Term              int
+	Snapshot          []byte
+}
+
+type InstallSnapshotArgsReply struct {
+	Success bool
+	Term    int
+}
+
+func (rf *Raft) sendInstallSnapshot(peer int, args *InstallSnapshotArgs, reply *InstallSnapshotArgsReply) bool {
+	ok := rf.peers[peer].Call("Raft.GetSnapshot", args, reply)
+	return ok
+}
+
+func (rf *Raft) GetSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotArgsReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if args.Term < rf.currentTerm {
+		reply.Success = false
+		return
+	}
+	if args.Term > rf.currentTerm {
+		rf.logPrintf("TERM UPDATE: T%d → T%d (from S%d) - converting to follower", rf.currentTerm, args.Term, args.LeaderId)
+		reply.Term = args.Term
+		// 进入下一个任期，刷新投票
+		rf.changeState(follower, -1, args.Term)
+		rf.resetElection()
+	}
+	if rf.log.InstallSnapshot(args.LastIncludedIndex, args.LastIncludedTerm, args.Snapshot) {
+		rf.logPrintf("InstallSnapshot from S%d [Index:%d Term:%d]", args.LeaderId, args.LastIncludedIndex, args.LastIncludedTerm)
+		rf.resetElection()
+		reply.Success = true
+		rf.applyCh <- raftapi.ApplyMsg{SnapshotValid: true, Snapshot: args.Snapshot, SnapshotTerm: args.LastIncludedTerm, SnapshotIndex: args.LastIncludedIndex}
+	} else {
+		rf.logPrintf("InstallSnapshot from S%d [Index:%d Term:%d] failed", args.LeaderId, args.LastIncludedIndex, args.LastIncludedTerm)
+		reply.Success = false
+	}
+	reply.Term = rf.currentTerm
 }
 
 func (rf *Raft) sendAppendEntries(peer int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
