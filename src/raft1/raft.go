@@ -281,6 +281,7 @@ func (rf *Raft) sendInstallSnapshot(peer int, args *InstallSnapshotArgs, reply *
 func (rf *Raft) GetSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotArgsReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 		return
@@ -290,13 +291,23 @@ func (rf *Raft) GetSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotArg
 		reply.Term = args.Term
 		// 进入下一个任期，刷新投票
 		rf.changeState(follower, -1, args.Term)
+		reply.Term = rf.currentTerm
 		rf.resetElection()
+	}
+	if args.LastIncludedIndex <= rf.log.LastIncludedIndex {
+		reply.Success = true
+		return
 	}
 	if rf.log.InstallSnapshot(args.LastIncludedIndex, args.LastIncludedTerm, args.Snapshot) {
 		rf.logPrintf("InstallSnapshot from S%d [Index:%d Term:%d]", args.LeaderId, args.LastIncludedIndex, args.LastIncludedTerm)
 		rf.resetElection()
 		reply.Success = true
-		rf.applyCh <- raftapi.ApplyMsg{SnapshotValid: true, Snapshot: args.Snapshot, SnapshotTerm: args.LastIncludedTerm, SnapshotIndex: args.LastIncludedIndex}
+		rf.commitIndex = max(rf.commitIndex, args.LastIncludedIndex)
+		rf.lastApplied = max(rf.lastApplied, args.LastIncludedIndex)
+		applyMsg := raftapi.ApplyMsg{SnapshotValid: true, Snapshot: args.Snapshot, SnapshotTerm: args.LastIncludedTerm, SnapshotIndex: args.LastIncludedIndex}
+		go func(applyMsg raftapi.ApplyMsg) {
+			rf.applyCh <- applyMsg
+		}(applyMsg)
 	} else {
 		rf.logPrintf("InstallSnapshot from S%d [Index:%d Term:%d] failed", args.LeaderId, args.LastIncludedIndex, args.LastIncludedTerm)
 		reply.Success = false
@@ -383,10 +394,17 @@ func (rf *Raft) commitLogBeforeIndex(leaderCommit int) {
 	lastLogIndex := rf.log.EndIndex
 	commitTo := min(leaderCommit, lastLogIndex)
 	rf.logPrintf("COMMIT: committing entries from index %d to %d (leaderCommit: %d)", rf.commitIndex+1, commitTo, leaderCommit)
+	applyMsgs := []raftapi.ApplyMsg{}
 	for i := rf.commitIndex + 1; i <= commitTo; i++ {
 		entry := rf.log.Get(i)
-		rf.applyCh <- raftapi.ApplyMsg{CommandValid: true, Command: entry.Command, CommandIndex: entry.Index}
+		applyMsg := raftapi.ApplyMsg{CommandValid: true, Command: entry.Command, CommandIndex: entry.Index}
+		applyMsgs = append(applyMsgs, applyMsg)
 	}
+	go func(applyMsgs []raftapi.ApplyMsg) {
+		for _, applyMsg := range applyMsgs {
+			rf.applyCh <- applyMsg
+		}
+	}(applyMsgs)
 	rf.commitIndex = commitTo
 	rf.lastApplied = commitTo
 	rf.persist()
