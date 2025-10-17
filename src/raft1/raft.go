@@ -53,8 +53,9 @@ func (rf *Raft) logPrintf(format string, a ...interface{}) {
 			stateStr = "CANDIDATE"
 		}
 
-		newFormat := fmt.Sprintf("[%s] Server-%d | Term:%d | State:%s | LastLogIdx:%d | LastLogTerm:%d | CommitIdx:%d | %s\n",
-			time.Now().Format("15:04:05.000"), rf.me, rf.currentTerm, stateStr, rf.log.EndIndex, rf.log.GetLast().Term, rf.commitIndex, format)
+		newFormat := fmt.Sprintf("[%s] Server-%d | Term:%d | State:%s | LastLogIdx:%d | LastLogTerm:%d | CommitIdx:%d | LastIncludedIndex:%d | LastIncludedTerm:%d |%s\n",
+			time.Now().Format("15:04:05.000"),
+			rf.me, rf.currentTerm, stateStr, rf.log.EndIndex, rf.log.GetLast().Term, rf.commitIndex, rf.log.LastIncludedIndex, rf.log.LastIncludedTerm, format)
 		fmt.Printf(newFormat, a...)
 	}
 }
@@ -453,7 +454,6 @@ type persistData struct {
 	CurrentTerm int
 	VotedFor    int
 	Log         logList
-	CommitIndex int
 }
 
 // save Raft's persistent state to stable storage,
@@ -476,17 +476,21 @@ func (rf *Raft) persist() {
 	data := persistData{
 		CurrentTerm: rf.currentTerm,
 		VotedFor:    rf.votedFor,
-		CommitIndex: rf.commitIndex,
 		Log:         rf.log,
 	}
-	rf.logPrintf("PERSIST: state saved (Log EndIdx:%d, BeginIdx:%d, Size:%d)", rf.log.EndIndex, rf.log.GetBeginIndex(), rf.log.Size)
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	if err := e.Encode(data); err != nil {
 		rf.logPrintf("PERSIST FAILED: encoding error: %v", err)
 	}
 	raftstate := w.Bytes()
-	rf.persister.Save(raftstate, nil)
+	if len(rf.log.Snapshot) == 0 {
+		rf.logPrintf("PERSIST: state saved (Log EndIdx:%d, BeginIdx:%d, Size:%d)", rf.log.EndIndex, rf.log.GetBeginIndex(), rf.log.Size)
+		rf.persister.Save(raftstate, nil)
+	} else {
+		rf.logPrintf("PERSIST: state saved (Log EndIdx:%d, BeginIdx:%d, Size:%d) and snapshot", rf.log.EndIndex, rf.log.GetBeginIndex(), rf.log.Size)
+		rf.persister.Save(raftstate, rf.log.Snapshot)
+	}
 }
 
 // restore previously persisted state.
@@ -506,7 +510,6 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.currentTerm = pdata.CurrentTerm
 		rf.votedFor = pdata.VotedFor
 		rf.log = pdata.Log
-		// rf.commitIndex = pdata.CommitIndex
 		rf.logPrintf("READ PERSIST: state recovered (Term:%d, VotedFor:%d, Log EndIdx:%d)", rf.currentTerm, rf.votedFor, rf.log.EndIndex)
 	}
 	// Your code here (3C).
