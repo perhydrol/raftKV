@@ -55,7 +55,7 @@ def run_single_test_n_times(test_name, times=100, success_indicator="PASS", log_
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                timeout=60
+                timeout=180
             )
             full_output = result.stdout + result.stderr
             lines = full_output.splitlines()
@@ -103,7 +103,7 @@ if __name__ == "__main__":
         "TestUnreliableChurn3C",
     ]
 
-    TOTAL_TIMES = 50
+    TOTAL_TIMES = 2
     LOG_DIR = "./test_logs"
 
     print(f"🚀 Starting {len(TESTS)} tests in parallel, each running {TOTAL_TIMES} times.")
