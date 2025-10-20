@@ -104,22 +104,15 @@ func (rf *Raft) isLock() bool {
 }
 
 type logList struct {
-	EndIndex int
-	Size     int
-
-	LastIncludedIndex int
-	LastIncludedTerm  int
 	Log               []Entry
 	Snapshot          []byte
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	EndIndex          int
+	Size              int
 }
 
 func (l *logList) GetBeginIndex() int {
-	if len(l.Log) == 0 {
-		if l.Snapshot == nil {
-			panic(fmt.Errorf("Try to get Begin but log and snapshot are all empty"))
-		}
-		return l.LastIncludedIndex + 1
-	}
 	return l.Log[0].Index
 }
 
@@ -129,56 +122,38 @@ func (l *logList) InstallSnapshot(index int, term int, snapshot []byte) bool {
 	}
 	l.LastIncludedIndex = index
 	l.LastIncludedTerm = term
-	if len(l.Log) == 0 {
-		l.EndIndex = index
-		l.Size = 0
-		l.Snapshot = snapshot
-		return true
-	}
 
-	newBegin := index + 1
-	keepOffset := newBegin - l.Log[0].Index
-
-	if keepOffset < len(l.Log) && keepOffset > 0 {
+	keepOffset := index - l.Log[0].Index // 我需要快照包含的最后一条日志成为哨兵节点
+	if keepOffset < len(l.Log) && keepOffset >= 0 {
 		l.Log = l.Log[keepOffset:]
 	} else {
 		l.Log = l.Log[:0]
+		// 新的哨兵节点
+		l.Log = append(l.Log, Entry{Command: nil, Index: index, Term: term})
 	}
 
-	if len(l.Log) == 0 {
-		l.EndIndex = l.LastIncludedIndex
-	} else {
-		l.EndIndex = l.Log[len(l.Log)-1].Index
-	}
+	l.EndIndex = l.Log[len(l.Log)-1].Index
 	l.Size = len(l.Log)
 	l.Snapshot = snapshot
 	return true
 }
 
-func (l *logList) GetIndexTerm(index int) int {
+func (l *logList) GetIndexTerm(index int) (int, error) {
 	if index < l.LastIncludedIndex || index > l.EndIndex {
-		panic(fmt.Sprintf("logIndex %d is not within snapshotted area (< LastIncludedIndex %d)",
-			index, l.LastIncludedIndex))
-	}
-	if index == l.LastIncludedIndex && l.Snapshot != nil {
-		return l.LastIncludedTerm
+		err := fmt.Errorf("logIndex %d is not within snapshotted area (< LastIncludedIndex %d)",
+			index, l.LastIncludedIndex)
+		return -1, err
 	}
 	offset := index - l.Log[0].Index
 	if offset < 0 || offset >= len(l.Log) {
-		panic(fmt.Sprintf("internal error: offset %d (index %d) out of array bounds [0:%d]",
-			offset, index, len(l.Log)))
+		err := fmt.Errorf("internal error: offset %d (index %d) out of array bounds [0:%d]",
+			offset, index, len(l.Log))
+		return -1, err
 	}
-	return l.Log[offset].Term
+	return l.Log[offset].Term, nil
 }
 
 func (l *logList) Get(logIndex int) Entry {
-	if logIndex == l.LastIncludedIndex && l.Snapshot != nil {
-		return Entry{
-			Term:    l.LastIncludedTerm,
-			Index:   l.LastIncludedIndex,
-			Command: nil,
-		}
-	}
 	if (logIndex - l.Log[0].Index) < 0 {
 		msg := fmt.Sprintf("logIndex: %d, l.BeginIndex: %d\n", logIndex, l.Log[0].Index)
 		fmt.Println(msg)
@@ -194,8 +169,8 @@ func (l *logList) Append(logs []Entry) {
 }
 
 func (l *logList) AppendList(target int, logs []Entry) error {
-	if target <= l.LastIncludedIndex {
-		return fmt.Errorf("truncate index %d is within snapshotted area (<= %d)", target, l.LastIncludedIndex)
+	if target < l.LastIncludedIndex {
+		return fmt.Errorf("truncate index %d is within snapshotted area (< %d)", target, l.LastIncludedIndex)
 	}
 	offset := target - l.Log[0].Index
 	if offset < 0 || offset > l.Size {
@@ -207,24 +182,10 @@ func (l *logList) AppendList(target int, logs []Entry) error {
 }
 
 func (l *logList) GetLast() Entry {
-	if len(l.Log) == 0 && l.Snapshot != nil {
-		return Entry{
-			Term:    l.LastIncludedTerm,
-			Index:   l.LastIncludedIndex,
-			Command: nil,
-		}
-	}
 	return l.Log[len(l.Log)-1]
 }
 
 func (l *logList) GetBegin() Entry {
-	if l.Snapshot != nil {
-		return Entry{
-			Term:    l.LastIncludedTerm,
-			Index:   l.LastIncludedIndex,
-			Command: nil,
-		}
-	}
 	return l.Log[0]
 }
 
@@ -238,47 +199,47 @@ func (l *logList) GetSlice(begin, end int) []Entry {
 }
 
 type Entry struct {
+	Command interface{}
 	Term    int
 	Index   int
-	Command interface{}
 }
 
 type AppendEntriesArgs struct {
+	Entries      []Entry
 	Term         int
 	LeaderId     int
 	PrevLogIndex int
 	PrevLogTerm  int
-	Entries      []Entry
 	LeaderCommit int
 }
 
 type AppendEntriesReply struct {
 	Term    int
-	Success bool
 	XTerm   int // term of conficting entry
 	XIndex  int // index of first conficting entry or XTerm
 	XLen    int // length of loss logs
+	Success bool
 }
 
 type InstallSnapshotArgs struct {
+	Snapshot          []byte
 	LeaderId          int
 	LastIncludedIndex int
 	LastIncludedTerm  int
 	Term              int
-	Snapshot          []byte
 }
 
-type InstallSnapshotArgsReply struct {
-	Success bool
+type InstallSnapshotReply struct {
 	Term    int
+	Success bool
 }
 
-func (rf *Raft) sendInstallSnapshot(peer int, args *InstallSnapshotArgs, reply *InstallSnapshotArgsReply) bool {
+func (rf *Raft) sendInstallSnapshot(peer int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
 	ok := rf.peers[peer].Call("Raft.GetSnapshot", args, reply)
 	return ok
 }
 
-func (rf *Raft) GetSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotArgsReply) {
+func (rf *Raft) GetSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	reply.Term = rf.currentTerm
@@ -305,9 +266,9 @@ func (rf *Raft) GetSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotArg
 		rf.commitIndex = max(rf.commitIndex, args.LastIncludedIndex)
 		rf.lastApplied = max(rf.lastApplied, args.LastIncludedIndex)
 		applyMsg := raftapi.ApplyMsg{SnapshotValid: true, Snapshot: args.Snapshot, SnapshotTerm: args.LastIncludedTerm, SnapshotIndex: args.LastIncludedIndex}
-		go func(applyMsg raftapi.ApplyMsg) {
-			rf.applyCh <- applyMsg
-		}(applyMsg)
+		go func(applyMsg *raftapi.ApplyMsg) {
+			rf.applyCh <- *applyMsg
+		}(&applyMsg)
 	} else {
 		rf.logPrintf("InstallSnapshot from S%d [Index:%d Term:%d] failed", args.LeaderId, args.LastIncludedIndex, args.LastIncludedTerm)
 		reply.Success = false
@@ -349,18 +310,29 @@ func (rf *Raft) GetAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRe
 	}
 
 	// PrevLogIndex 在范围内，再检查 Term
-	if args.PrevLogTerm != rf.log.GetIndexTerm(args.PrevLogIndex) {
+	rfPrevIndex, err := rf.log.GetIndexTerm(args.PrevLogIndex)
+	if err != nil {
+		rf.logPrintf(err.Error())
+		panic(err)
+	}
+	if args.PrevLogTerm != rfPrevIndex {
 		rf.logPrintf("REJECT AppendEntries: log mismatch at index %d (leader term: %d, local term: %d)",
-			args.PrevLogIndex, args.PrevLogTerm, rf.log.GetIndexTerm(args.PrevLogIndex))
+			args.PrevLogIndex, args.PrevLogTerm, rfPrevIndex)
 
 		reply.Term = rf.currentTerm
 		reply.Success = false
 
 		// 优化：快速回退
 		// 找到冲突任期的第一个日志条目的索引
-		reply.XTerm = rf.log.GetIndexTerm(args.PrevLogIndex)
+		reply.XTerm = rfPrevIndex
 		firstIndexOfTerm := args.PrevLogIndex
-		for firstIndexOfTerm > rf.log.GetBegin().Index && rf.log.GetIndexTerm(firstIndexOfTerm-1) == reply.XTerm {
+		for firstIndexOfTerm > rf.log.GetBegin().Index {
+			if tempIndex, err := rf.log.GetIndexTerm(firstIndexOfTerm - 1); err != nil {
+				rf.logPrintf(err.Error())
+				panic(err)
+			} else if tempIndex != reply.XTerm {
+				break
+			}
 			firstIndexOfTerm--
 		}
 		reply.XIndex = firstIndexOfTerm
@@ -394,17 +366,17 @@ func (rf *Raft) commitLogBeforeIndex(leaderCommit int) {
 	lastLogIndex := rf.log.EndIndex
 	commitTo := min(leaderCommit, lastLogIndex)
 	rf.logPrintf("COMMIT: committing entries from index %d to %d (leaderCommit: %d)", rf.commitIndex+1, commitTo, leaderCommit)
-	applyMsgs := []raftapi.ApplyMsg{}
+	applyMsgs := make([]raftapi.ApplyMsg, 0, commitTo-rf.commitIndex)
 	for i := rf.commitIndex + 1; i <= commitTo; i++ {
 		entry := rf.log.Get(i)
 		applyMsg := raftapi.ApplyMsg{CommandValid: true, Command: entry.Command, CommandIndex: entry.Index}
 		applyMsgs = append(applyMsgs, applyMsg)
 	}
-	go func(applyMsgs []raftapi.ApplyMsg) {
+	go func() {
 		for _, applyMsg := range applyMsgs {
 			rf.applyCh <- applyMsg
 		}
-	}(applyMsgs)
+	}()
 	rf.commitIndex = commitTo
 	rf.lastApplied = commitTo
 	rf.persist()
@@ -468,10 +440,15 @@ func (rf *Raft) leaderHeart() {
 			go func() {
 				starTime := time.Now()
 				rf.lock()
+				prevLogTerm, err := rf.log.GetIndexTerm(rf.nextIndex[i] - 1)
+				if err != nil {
+					rf.logPrintf(err.Error())
+					panic(err)
+				}
 				heartPacket := AppendEntriesArgs{
 					Term:         rf.currentTerm,
 					LeaderId:     rf.me,
-					PrevLogTerm:  rf.log.GetIndexTerm(rf.nextIndex[i] - 1),
+					PrevLogTerm:  prevLogTerm,
 					PrevLogIndex: rf.nextIndex[i] - 1,
 					Entries:      nil,
 					LeaderCommit: rf.commitIndex,
@@ -514,9 +491,9 @@ func (rf *Raft) GetState() (int, bool) {
 }
 
 type persistData struct {
+	Log         logList
 	CurrentTerm int
 	VotedFor    int
-	Log         logList
 }
 
 // save Raft's persistent state to stable storage,
@@ -598,7 +575,14 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		return
 	}
 	rf.logPrintf("Snapshot index:%d is valid", index)
-	rf.log.InstallSnapshot(index, rf.log.GetIndexTerm(index), snapshot)
+	term, err := rf.log.GetIndexTerm(index)
+	if err != nil {
+		rf.logPrintf("Snapshot index %d invalid: %v", index, err)
+		return
+	}
+	rf.log.InstallSnapshot(index, term, snapshot)
+	rf.commitIndex = max(rf.commitIndex, index)
+	rf.lastApplied = max(rf.lastApplied, index)
 	rf.persist()
 }
 
@@ -616,8 +600,8 @@ type RequestVoteArgs struct {
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (3A).
-	Term        int
 	VoteGranted bool
+	Term        int
 }
 
 // example RequestVote RPC handler.
@@ -801,7 +785,12 @@ func (rf *Raft) commitLog(successReply <-chan int) {
 			if waitCommit[ItemIndex]+1 > majority {
 				rf.lock()
 				if rf.state == leader && !rf.killed() {
-					if rf.log.GetIndexTerm(ItemIndex) == rf.currentTerm {
+					ItemTerm, err := rf.log.GetIndexTerm(ItemIndex)
+					if err != nil {
+						rf.logPrintf(err.Error())
+						panic(err)
+					}
+					if ItemTerm == rf.currentTerm {
 						rf.commitLogBeforeIndex(ItemIndex)
 						rf.logPrintf("logIndex: %d get majority and commitIndex: %d", ItemIndex, rf.commitIndex)
 					}
@@ -821,10 +810,16 @@ func (rf *Raft) genAppendEntriesArgs(server int) AppendEntriesArgs {
 			Term:         rf.currentTerm,
 			LeaderId:     rf.me,
 			PrevLogIndex: rf.nextIndex[server] - 1,
-			PrevLogTerm:  rf.log.GetIndexTerm(rf.nextIndex[server] - 1),
+			PrevLogTerm:  -1,
 			Entries:      nil,
 			LeaderCommit: rf.commitIndex,
 		}
+		prevLogTerm, err := rf.log.GetIndexTerm(rf.nextIndex[server] - 1)
+		if err != nil {
+			rf.logPrintf(err.Error())
+			panic(err)
+		}
+		args.PrevLogTerm = prevLogTerm
 		args.Entries = append(args.Entries, rf.log.GetSlice(rf.nextIndex[server], -1)...)
 	}
 	return args
@@ -855,9 +850,14 @@ func (rf *Raft) updateNextIndex(server int, appendEntriesReply AppendEntriesRepl
 		// 1. Leader 查找自己日志中最后一个 XTerm 出现的索引 (lastXTermIndex)
 		lastXTermIndex := -1
 		for i := rf.log.GetLast().Index; i >= rf.log.GetBegin().Index; i-- {
-			if rf.log.GetIndexTerm(i) == appendEntriesReply.XTerm {
+			logTerm, err := rf.log.GetIndexTerm(i)
+			if err != nil {
+				rf.logPrintf(err.Error())
+				panic(err)
+			}
+			if logTerm == appendEntriesReply.XTerm {
 				lastXTermIndex = i
-				break // 找到最后一个匹配的条目
+				break
 			}
 		}
 
@@ -880,15 +880,59 @@ func (rf *Raft) updateNextIndex(server int, appendEntriesReply AppendEntriesRepl
 			server, newNextIndex)
 	}
 
-	// 确保 nextIndex 不会小于日志的起始索引（快照后的第一条日志索引）
 	if newNextIndex < minNextIndex {
 		newNextIndex = minNextIndex
 	}
 	rf.nextIndex[server] = newNextIndex
 }
 
+func (rf *Raft) SendSnapshot(server int) {
+	rf.lock()
+	if rf.killed() || rf.state != leader || rf.nextIndex[server] > rf.log.LastIncludedIndex {
+		rf.unlock()
+		return
+	}
+	args := InstallSnapshotArgs{
+		Term:              rf.currentTerm,
+		LeaderId:          rf.me,
+		LastIncludedIndex: rf.log.LastIncludedIndex,
+		LastIncludedTerm:  rf.log.LastIncludedTerm,
+		Snapshot:          rf.log.Snapshot,
+	}
+	rf.unlock()
+	var reply InstallSnapshotReply
+	for !rf.sendInstallSnapshot(server, &args, &reply) {
+		rf.lock()
+		if rf.killed() || rf.state != leader || rf.nextIndex[server] > rf.log.LastIncludedIndex {
+			rf.unlock()
+			return
+		}
+		rf.unlock()
+	}
+	if reply.Success {
+		rf.lock()
+		if !rf.killed() && rf.state == leader && rf.nextIndex[server] <= rf.log.LastIncludedIndex {
+			rf.logPrintf("success to install snapshot to server-%d and nextIndex[%d] update to %d (snapshotLastIndex:%d, snapshotLastTerm:%d)",
+				server, server, rf.log.LastIncludedIndex+1, args.LastIncludedIndex, args.LastIncludedTerm)
+			rf.nextIndex[server] = rf.log.LastIncludedIndex + 1
+		}
+		rf.unlock()
+		return
+	} else {
+		if reply.Term > rf.currentTerm {
+			rf.lock()
+			rf.changeState(follower, -1, reply.Term)
+			rf.resetElection()
+			rf.unlock()
+			return
+		}
+		rf.logPrintf("WARNING failed to install snapshot to server-%d (snapshotLastIndex:%d, snapshotLastTerm:%d)",
+			server, args.LastIncludedIndex, args.LastIncludedTerm)
+	}
+}
+
+// Send logs to server, one goroutine per server
 func (rf *Raft) sendLog(server int, successReply chan<- int) {
-	// flyingIndex := 0
 sendLogMainLoop:
 	for !rf.killed() {
 		rf.lock()
@@ -899,7 +943,15 @@ sendLogMainLoop:
 			rf.unlock()
 			continue
 		}
-		// 生成 AppendEntries 请求
+
+		// leader已经找不到同步点Index,需要使用快照直接同步
+		if rf.log.Snapshot != nil && rf.nextIndex[server] <= rf.log.LastIncludedIndex {
+			rf.logPrintf("send snapshot to server %d", server)
+			rf.unlock()
+			rf.SendSnapshot(server)
+			continue sendLogMainLoop
+		}
+		// Generate AppendEntries request
 		appendEntriesArgs := rf.genAppendEntriesArgs(server)
 		if len(appendEntriesArgs.Entries) == 0 {
 			rf.unlock()
@@ -908,7 +960,7 @@ sendLogMainLoop:
 		lastIndex := appendEntriesArgs.Entries[len(appendEntriesArgs.Entries)-1].Index
 		rf.logPrintf("send Last Index: %d", lastIndex)
 		rf.unlock()
-		// 发送 RPC（锁外）
+		// Send RPC (outside lock)
 		// flyingIndex = appendEntriesArgs.Entries[len(appendEntriesArgs.Entries)-1].Index
 		var reply AppendEntriesReply
 		for !rf.sendAppendEntries(server, &appendEntriesArgs, &reply) {
@@ -919,7 +971,7 @@ sendLogMainLoop:
 			}
 			rf.unlock()
 		}
-		// 处理响应(确保接受的数据与发送任期匹配)
+		// Process response (ensure received data matches sent term)
 		rf.lock()
 		if reply.Success && reply.Term == rf.currentTerm && rf.state == leader {
 			successReply <- lastIndex
@@ -935,7 +987,6 @@ sendLogMainLoop:
 			if rf.state == leader {
 				rf.updateNextIndex(server, reply, appendEntriesArgs)
 			}
-			// flyingIndex = rf.nextIndex[server] - 1
 		}
 		rf.unlock()
 	}
