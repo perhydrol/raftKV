@@ -26,7 +26,7 @@ import (
 const debug = true
 
 const (
-	electionTimeOut = 150
+	electionTimeOut = 600
 	heartTimeOut    = 10
 )
 
@@ -86,21 +86,14 @@ type Raft struct {
 	// state a Raft server must maintain.
 	applyCh      chan raftapi.ApplyMsg
 	getNewItemIn sync.Cond
-	isLocked     int32
 }
 
 func (rf *Raft) lock() {
 	rf.mu.Lock()
-	atomic.StoreInt32(&rf.isLocked, 1)
 }
 
 func (rf *Raft) unlock() {
 	rf.mu.Unlock()
-	atomic.StoreInt32(&rf.isLocked, 0)
-}
-
-func (rf *Raft) isLock() bool {
-	return atomic.LoadInt32(&rf.isLocked) == 1
 }
 
 type logList struct {
@@ -266,9 +259,8 @@ func (rf *Raft) GetSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotRep
 		rf.commitIndex = max(rf.commitIndex, args.LastIncludedIndex)
 		rf.lastApplied = max(rf.lastApplied, args.LastIncludedIndex)
 		applyMsg := raftapi.ApplyMsg{SnapshotValid: true, Snapshot: args.Snapshot, SnapshotTerm: args.LastIncludedTerm, SnapshotIndex: args.LastIncludedIndex}
-		go func(applyMsg *raftapi.ApplyMsg) {
-			rf.applyCh <- *applyMsg
-		}(&applyMsg)
+		rf.applyCh <- applyMsg
+		rf.persist()
 	} else {
 		rf.logPrintf("InstallSnapshot from S%d [Index:%d Term:%d] failed", args.LeaderId, args.LastIncludedIndex, args.LastIncludedTerm)
 		reply.Success = false
@@ -298,6 +290,21 @@ func (rf *Raft) GetAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRe
 		// 进入下一个任期，刷新投票
 		rf.changeState(follower, -1, args.Term)
 		rf.resetElection()
+	}
+
+	// 检查 1: PrevLogIndex 是否被快照清除 (Log too old/snapshotted)
+	// PrevLogIndex < 当前日志数组的起始索引 (LastIncludedIndex)
+	if args.PrevLogIndex < rf.log.GetBeginIndex() {
+		rf.logPrintf("REJECT AppendEntries: PrevLogIndex %d < LastIncludedIndex %d. Leader must send snapshot.",
+			args.PrevLogIndex, rf.log.GetBeginIndex())
+		reply.Term = rf.currentTerm
+		reply.Success = false
+
+		// 告知 Leader 应该从快照后的第一条日志开始同步
+		reply.XIndex = rf.log.GetBeginIndex() + 1
+		reply.XTerm = rf.log.LastIncludedTerm
+		rf.resetElection()
+		return
 	}
 	if args.PrevLogIndex > rf.log.GetLast().Index {
 		rf.logPrintf("REJECT AppendEntries: log mismatch, PrevLogIndex %d is out of bounds (last index is %d)", args.PrevLogIndex, rf.log.GetLast().Index)
@@ -372,11 +379,9 @@ func (rf *Raft) commitLogBeforeIndex(leaderCommit int) {
 		applyMsg := raftapi.ApplyMsg{CommandValid: true, Command: entry.Command, CommandIndex: entry.Index}
 		applyMsgs = append(applyMsgs, applyMsg)
 	}
-	go func() {
-		for _, applyMsg := range applyMsgs {
-			rf.applyCh <- applyMsg
-		}
-	}()
+	for _, applyMsg := range applyMsgs {
+		rf.applyCh <- applyMsg
+	}
 	rf.commitIndex = commitTo
 	rf.lastApplied = commitTo
 	rf.persist()
@@ -440,40 +445,47 @@ func (rf *Raft) leaderHeart() {
 			go func() {
 				starTime := time.Now()
 				rf.lock()
-				prevLogTerm, err := rf.log.GetIndexTerm(rf.nextIndex[i] - 1)
-				if err != nil {
-					rf.logPrintf(err.Error())
-					panic(err)
-				}
-				heartPacket := AppendEntriesArgs{
-					Term:         rf.currentTerm,
-					LeaderId:     rf.me,
-					PrevLogTerm:  prevLogTerm,
-					PrevLogIndex: rf.nextIndex[i] - 1,
-					Entries:      nil,
-					LeaderCommit: rf.commitIndex,
-				}
-				rf.unlock()
-				reply := AppendEntriesReply{}
-				for !rf.sendAppendEntries(i, &heartPacket, &reply) {
-					rf.lock()
-					if rf.killed() ||
-						rf.state != leader ||
-						time.Now().After(starTime.Add(heartTimeOut*2*time.Millisecond)) {
-						rf.unlock()
-						return
+				// follower日志差距过大,需要快照同步
+				if rf.log.Snapshot != nil && rf.nextIndex[i]-1 < rf.log.GetBeginIndex() {
+					rf.logPrintf("send snapshot to server %d", i)
+					rf.unlock()
+					rf.SendSnapshot(i)
+				} else {
+					prevLogTerm, err := rf.log.GetIndexTerm(rf.nextIndex[i] - 1)
+					if err != nil {
+						rf.logPrintf(err.Error())
+						panic(err)
+					}
+					heartPacket := AppendEntriesArgs{
+						Term:         rf.currentTerm,
+						LeaderId:     rf.me,
+						PrevLogTerm:  prevLogTerm,
+						PrevLogIndex: rf.nextIndex[i] - 1,
+						Entries:      nil,
+						LeaderCommit: rf.commitIndex,
 					}
 					rf.unlock()
-				}
-				rf.lock()
-				defer rf.unlock()
-				if !reply.Success && reply.Term > rf.currentTerm {
-					rf.logPrintf("Find a bigger Term: oldTerm:%d newTerm:%d. changeState to follower.", rf.currentTerm, reply.Term)
-					// 进入下一个任期，刷新投票
-					rf.changeState(follower, -1, reply.Term)
-					rf.resetElection()
-				} else {
-					rf.updateNextIndex(i, reply, heartPacket)
+					reply := AppendEntriesReply{}
+					for !rf.sendAppendEntries(i, &heartPacket, &reply) {
+						rf.lock()
+						if rf.killed() ||
+							rf.state != leader ||
+							time.Now().After(starTime.Add(heartTimeOut*2*time.Millisecond)) {
+							rf.unlock()
+							return
+						}
+						rf.unlock()
+					}
+					rf.lock()
+					defer rf.unlock()
+					if !reply.Success && reply.Term > rf.currentTerm {
+						rf.logPrintf("Find a bigger Term: oldTerm:%d newTerm:%d. changeState to follower.", rf.currentTerm, reply.Term)
+						// 进入下一个任期，刷新投票
+						rf.changeState(follower, -1, reply.Term)
+						rf.resetElection()
+					} else {
+						rf.updateNextIndex(i, reply, heartPacket)
+					}
 				}
 			}()
 		}
@@ -551,6 +563,12 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.votedFor = pdata.VotedFor
 		rf.log = pdata.Log
 		rf.logPrintf("READ PERSIST: state recovered (Term:%d, VotedFor:%d, Log EndIdx:%d)", rf.currentTerm, rf.votedFor, rf.log.EndIndex)
+		if rf.log.Snapshot != nil {
+			applyMsg := raftapi.ApplyMsg{SnapshotValid: true, Snapshot: rf.log.Snapshot, SnapshotTerm: rf.log.LastIncludedTerm, SnapshotIndex: rf.log.LastIncludedIndex}
+			rf.applyCh <- applyMsg
+		}
+		rf.commitIndex = rf.log.LastIncludedIndex
+		rf.lastApplied = rf.log.LastIncludedIndex
 	}
 	// Your code here (3C).
 }
