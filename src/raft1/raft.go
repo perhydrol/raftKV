@@ -1022,6 +1022,9 @@ sendLogMainLoop:
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	close(rf.applyCh)
 }
 
 func (rf *Raft) killed() bool {
