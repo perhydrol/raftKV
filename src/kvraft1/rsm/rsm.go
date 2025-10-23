@@ -139,10 +139,9 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 	rsm.pendingOpsId[index] = op.Id
 	defer func() {
 		rsm.mu.Lock()
-		close(awakeCh)
 		delete(rsm.pendingOps, index)
-		delete(rsm.pendingOpsId, index)
 		rsm.mu.Unlock()
+		close(awakeCh)
 	}()
 	rsm.mu.Unlock()
 	select {
