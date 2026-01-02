@@ -5,3 +5,5 @@ diff.txt
 *.prof
 *.test
 src/raft1/raft.go.bk
+src/git.diff
+.marscode/deviceInfo.json
