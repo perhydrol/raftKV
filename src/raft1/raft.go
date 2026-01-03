@@ -22,6 +22,7 @@ import (
 	"6.5840/raftapi"
 	tester "6.5840/tester1"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 const debug = true
@@ -87,12 +88,14 @@ type Raft struct {
 	applyCh      chan raftapi.ApplyMsg
 	getNewItemIn sync.Cond
 
-	logger *zap.Logger
+	logger          *zap.Logger
+	successfulReply chan int
 }
 
 func (rf *Raft) initLogger() {
-	config := zap.NewDevelopmentConfig()
+	config := zap.NewProductionConfig()
 	config.DisableStacktrace = true
+	config.EncoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
 	l, _ := config.Build()
 	rf.logger = l.With(zap.Int("Srv", rf.me))
 }
@@ -753,28 +756,26 @@ func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) 
 	return index, term, true
 }
 
-func (rf *Raft) commitLog(successReply <-chan int) {
+func (rf *Raft) commitLog() {
 	waitCommit := make(map[int]int)
 	majority := len(rf.peers) / 2
 	for !rf.killed() {
-		select {
-		case ItemIndex := <-successReply:
-			waitCommit[ItemIndex]++
-			if waitCommit[ItemIndex]+1 > majority {
-				rf.lock()
-				if rf.state == leader && !rf.killed() {
-					ItemTerm, err := rf.log.GetIndexTerm(ItemIndex)
-					if err != nil {
-						rf.logger.Error("Snapshot error", zap.Error(err))
-						panic(err)
-					}
-					if ItemTerm == rf.currentTerm {
-						rf.commitLogBeforeIndex(ItemIndex)
-						rf.logger.Info("logIndex get majority and commitIndex", zap.Int("logIndex", ItemIndex), zap.Int("commitIndex", rf.commitIndex))
-					}
+		itemIndex := <-rf.successfulReply
+		waitCommit[itemIndex]++
+		if waitCommit[itemIndex]+1 > majority {
+			rf.lock()
+			if rf.state == leader && !rf.killed() {
+				itemTerm, err := rf.log.GetIndexTerm(itemIndex)
+				if err != nil {
+					rf.logger.Error("Snapshot error", zap.Error(err))
+					panic(err)
 				}
-				rf.unlock()
+				if itemTerm == rf.currentTerm {
+					rf.commitLogBeforeIndex(itemIndex)
+					rf.logger.Info("logIndex get majority and commitIndex", zap.Int("logIndex", itemIndex), zap.Int("commitIndex", rf.commitIndex))
+				}
 			}
+			rf.unlock()
 		}
 	}
 }
@@ -811,8 +812,14 @@ func (rf *Raft) updateNextIndex(server int, appendEntriesReply AppendEntriesRepl
 	defer func() {
 		rf.logger.Info("update rf.nextIndex", zap.Int("server", server), zap.Int("nextIndex", rf.nextIndex[server]))
 	}()
-	rf.logger.Info("server info", zap.Int("id", server), zap.Int("term", appendEntriesReply.Term), zap.Bool("success", appendEntriesReply.Success),
-		zap.Int("XTerm", appendEntriesReply.XTerm), zap.Int("XIndex", appendEntriesReply.XIndex), zap.Int("XLen", appendEntriesReply.XLen))
+	rf.logger.Info("server info",
+		zap.Int("id", server),
+		zap.Int("term", appendEntriesReply.Term),
+		zap.Bool("success", appendEntriesReply.Success),
+		zap.Int("XTerm", appendEntriesReply.XTerm),
+		zap.Int("XIndex", appendEntriesReply.XIndex),
+		zap.Int("XLen", appendEntriesReply.XLen),
+	)
 	if appendEntriesReply.Success {
 		if len(appendEntiresArgs.Entries) != 0 {
 			rf.nextIndex[server] = appendEntiresArgs.Entries[len(appendEntiresArgs.Entries)-1].Index + 1
@@ -827,7 +834,7 @@ func (rf *Raft) updateNextIndex(server int, appendEntriesReply AppendEntriesRepl
 
 	if appendEntriesReply.XTerm != -1 {
 		// Case 2: Term 冲突 (Log Mismatch)
-		// 1. Leader 查找自己日志中最后一个 XTerm 出现的索引 (lastXTermIndex)
+		// Leader 查找自己日志中最后一个 XTerm 出现的索引
 		lastXTermIndex := -1
 		for i := rf.log.GetLast().Index; i >= rf.log.GetBegin().Index; i-- {
 			logTerm, err := rf.log.GetIndexTerm(i)
@@ -842,16 +849,24 @@ func (rf *Raft) updateNextIndex(server int, appendEntriesReply AppendEntriesRepl
 		}
 
 		if lastXTermIndex != -1 {
-			// 2a. Leader 包含 XTerm：nextIndex 设置为 lastXTermIndex + 1
+			// Leader 包含 XTerm：nextIndex 设置为 lastXTermIndex + 1
 			newNextIndex = lastXTermIndex + 1
-			rf.logger.Info("(updateNextIndex) rf has term", zap.Int("XTerm", appendEntriesReply.XTerm), zap.Int("server", server), zap.Int("newNextIndex", newNextIndex))
+			rf.logger.Info("(updateNextIndex) rf has term",
+				zap.Int("XTerm", appendEntriesReply.XTerm),
+				zap.Int("server", server),
+				zap.Int("newNextIndex", newNextIndex),
+			)
 		} else {
-			// 2b. Leader 不包含 XTerm：nextIndex 设置为 XIndex
+			// Leader 不包含 XTerm：nextIndex 设置为 XIndex
 			newNextIndex = appendEntriesReply.XIndex
-			rf.logger.Info("(updateNextIndex) rf does not have term", zap.Int("XTerm", appendEntriesReply.XTerm), zap.Int("server", server), zap.Int("newNextIndex", newNextIndex))
+			rf.logger.Info("(updateNextIndex) rf does not have term",
+				zap.Int("XTerm", appendEntriesReply.XTerm),
+				zap.Int("server", server),
+				zap.Int("newNextIndex", newNextIndex),
+			)
 		}
 	} else {
-		// Case 1: PrevLogIndex 越界 (Log Out of Bounds)
+		// Case 1: PrevLogIndex 越界
 		// Leader 直接跳到 XLen (跟随者日志的下一条日志索引，即跟随者日志长度)
 		newNextIndex = appendEntriesReply.XLen
 		rf.logger.Info("(updateNextIndex) PrevLogIndex out of bounds", zap.Int("server", server), zap.Int("newNextIndex", newNextIndex))
@@ -889,8 +904,12 @@ func (rf *Raft) SendSnapshot(server int) {
 	if reply.Success {
 		rf.lock()
 		if !rf.killed() && rf.state == leader && rf.nextIndex[server] <= rf.log.LastIncludedIndex {
-			rf.logger.Info("success to install snapshot to server", zap.Int("server", server), zap.Int("nextIndex", rf.log.LastIncludedIndex+1),
-				zap.Int("snapshotLastIndex", args.LastIncludedIndex), zap.Int("snapshotLastTerm", args.LastIncludedTerm))
+			rf.logger.Info("success to install snapshot to server",
+				zap.Int("server", server),
+				zap.Int("nextIndex", rf.log.LastIncludedIndex+1),
+				zap.Int("snapshotLastIndex", args.LastIncludedIndex),
+				zap.Int("snapshotLastTerm", args.LastIncludedTerm),
+			)
 			rf.nextIndex[server] = rf.log.LastIncludedIndex + 1
 		}
 		rf.unlock()
@@ -903,12 +922,16 @@ func (rf *Raft) SendSnapshot(server int) {
 			rf.unlock()
 			return
 		}
-		rf.logger.Warn("failed to install snapshot to server", zap.Int("server", server), zap.Int("snapshotLastIndex", args.LastIncludedIndex), zap.Int("snapshotLastTerm", args.LastIncludedTerm))
+		rf.logger.Warn("failed to install snapshot to server",
+			zap.Int("server", server),
+			zap.Int("snapshotLastIndex", args.LastIncludedIndex),
+			zap.Int("snapshotLastTerm", args.LastIncludedTerm),
+		)
 	}
 }
 
 // Send logs to server, one goroutine per server
-func (rf *Raft) sendLog(server int, successReply chan<- int) {
+func (rf *Raft) sendLog(server int) {
 sendLogMainLoop:
 	for !rf.killed() {
 		rf.lock()
@@ -950,7 +973,7 @@ sendLogMainLoop:
 		// Process response (ensure received data matches sent term)
 		rf.lock()
 		if reply.Success && reply.Term == rf.currentTerm && rf.state == leader {
-			successReply <- lastIndex
+			rf.successfulReply <- lastIndex
 			rf.logger.Info("index get a successful reply", zap.Int("lastIndex", lastIndex))
 			rf.updateNextIndex(server, reply, appendEntriesArgs)
 		} else {
@@ -983,6 +1006,7 @@ func (rf *Raft) Kill() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	close(rf.applyCh)
+	close(rf.successfulReply)
 }
 
 func (rf *Raft) killed() bool {
@@ -1036,17 +1060,18 @@ func (rf *Raft) ticker() {
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *tester.Persister, applyCh chan raftapi.ApplyMsg) raftapi.Raft {
 	rf := &Raft{
-		mu:            sync.Mutex{},
-		currentTerm:   0,
-		votedFor:      -1,
-		log:           logList{},
-		commitIndex:   0,
-		lastApplied:   0,
-		nextIndex:     make([]int, len(peers)),
-		matchIndex:    make([]int, len(peers)),
-		state:         follower,
-		electionTimer: time.NewTimer(time.Duration(rand.Intn(100)) * time.Millisecond),
-		applyCh:       applyCh,
+		mu:              sync.Mutex{},
+		currentTerm:     0,
+		votedFor:        -1,
+		log:             logList{},
+		commitIndex:     0,
+		lastApplied:     0,
+		nextIndex:       make([]int, len(peers)),
+		matchIndex:      make([]int, len(peers)),
+		state:           follower,
+		electionTimer:   time.NewTimer(time.Duration(rand.Intn(100)) * time.Millisecond),
+		applyCh:         applyCh,
+		successfulReply: make(chan int, len(peers)),
 	}
 	rf.initLogger()
 	rf.log.Snapshot = nil
@@ -1074,13 +1099,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.logger.Info("init")
 	// start ticker goroutine to start elections
 	go rf.ticker()
-	successfulReply := make(chan int, len(peers))
 	for i := range peerLen {
 		if i == me {
 			continue
 		}
-		go rf.sendLog(i, successfulReply)
+		go rf.sendLog(i)
 	}
-	go rf.commitLog(successfulReply)
+	go rf.commitLog()
 	return rf
 }
