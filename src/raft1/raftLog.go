@@ -3,7 +3,7 @@ package raft
 import "fmt"
 
 type logList struct {
-	Log               []Entry
+	Log               []*Entry
 	Snapshot          []byte
 	LastIncludedIndex int
 	LastIncludedTerm  int
@@ -22,15 +22,20 @@ func (l *logList) InstallSnapshot(index int, term int, snapshot []byte) bool {
 	l.LastIncludedIndex = index
 	l.LastIncludedTerm = term
 
+	var newLog []*Entry
+	// 始终创建一个新的哨兵节点
+	sentinel := Entry{Command: nil, Index: index, Term: term}
+
 	keepOffset := index - l.Log[0].Index // 我需要快照包含的最后一条日志成为哨兵节点
 	if keepOffset < len(l.Log) && keepOffset >= 0 {
-		l.Log = l.Log[keepOffset:]
+		newLog = make([]*Entry, len(l.Log)-keepOffset)
+		copy(newLog, l.Log[keepOffset:])
+		newLog[0] = &sentinel
 	} else {
-		l.Log = l.Log[:0]
-		// 新的哨兵节点
-		l.Log = append(l.Log, Entry{Command: nil, Index: index, Term: term})
+		newLog = []*Entry{&sentinel}
 	}
 
+	l.Log = newLog
 	l.EndIndex = l.Log[len(l.Log)-1].Index
 	l.Size = len(l.Log)
 	l.Snapshot = snapshot
@@ -58,16 +63,16 @@ func (l *logList) Get(logIndex int) Entry {
 		fmt.Println(msg)
 		panic(msg)
 	}
-	return l.Log[logIndex-l.Log[0].Index]
+	return *l.Log[logIndex-l.Log[0].Index]
 }
 
-func (l *logList) Append(logs []Entry) {
+func (l *logList) Append(logs []*Entry) {
 	l.Log = append(l.Log, logs...)
 	l.EndIndex = l.Log[len(l.Log)-1].Index
 	l.Size = len(l.Log)
 }
 
-func (l *logList) AppendList(target int, logs []Entry) error {
+func (l *logList) AppendList(target int, logs []*Entry) error {
 	if target < l.LastIncludedIndex {
 		return fmt.Errorf("truncate index %d is within snapshotted area (< %d)", target, l.LastIncludedIndex)
 	}
@@ -81,14 +86,14 @@ func (l *logList) AppendList(target int, logs []Entry) error {
 }
 
 func (l *logList) GetLast() Entry {
-	return l.Log[len(l.Log)-1]
+	return *l.Log[len(l.Log)-1]
 }
 
 func (l *logList) GetBegin() Entry {
-	return l.Log[0]
+	return *l.Log[0]
 }
 
-func (l *logList) GetSlice(begin, end int) []Entry {
+func (l *logList) GetSlice(begin, end int) []*Entry {
 	beginOffset := begin - l.Log[0].Index
 	if end == -1 {
 		return l.Log[beginOffset:]
