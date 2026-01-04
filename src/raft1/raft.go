@@ -90,6 +90,7 @@ type Raft struct {
 
 	logger          *zap.Logger
 	successfulReply chan int
+	bus             *registry
 }
 
 func (rf *Raft) initLogger() {
@@ -1072,8 +1073,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		electionTimer:   time.NewTimer(time.Duration(rand.Intn(100)) * time.Millisecond),
 		applyCh:         applyCh,
 		successfulReply: make(chan int, len(peers)),
+		bus:             initRegistry(),
 	}
 	rf.initLogger()
+
 	rf.log.Snapshot = nil
 	peerLen := len(peers)
 	rf.getNewItemIn = *sync.NewCond(&rf.mu)
