@@ -2,6 +2,12 @@ package raft
 
 import "fmt"
 
+type Entry struct {
+	Command interface{}
+	Term    int
+	Index   int
+}
+
 type logList struct {
 	Log               []*Entry
 	Snapshot          []byte
