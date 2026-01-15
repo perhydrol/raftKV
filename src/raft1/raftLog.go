@@ -1,109 +1,85 @@
 package raft
 
-import "fmt"
+import (
+	"fmt"
+
+	"go.uber.org/zap"
+)
 
 type Entry struct {
-	Command interface{}
+	Command *interface{}
 	Term    int
 	Index   int
 }
 
-type logList struct {
-	Log               []*Entry
-	Snapshot          []byte
-	LastIncludedIndex int
-	LastIncludedTerm  int
-	EndIndex          int
-	Size              int
+type raftLog struct {
+	logData   []Entry
+	offset    int // 未安装快照时为1,安装完成后为快照最后一个index+1.
+	committed uint64
+	// applying 是应用程序被指示应用于其状态机的最高日志位置。其中一些条目可能正处于应用过程中，尚未达到已应用状态。
+	// 使用方式：在接收 Ready 结构体时，该字段会递增。
+	// 不变性：applied <= applying && applying <= committed
+	applying uint64
+	// applied 是应用程序成功应用于其状态机的最高日志位置。
+	// 使用方式：在 Ready 结构体中已提交条目被应用（无论是同步还是异步）后推进时，该字段会递增。
+	// 不变性：applied <= committed
+	applied uint64
+
+	logger *zap.Logger
 }
 
-func (l *logList) GetBeginIndex() int {
-	return l.Log[0].Index
+func newRaftLog(logger *zap.Logger) raftLog {
+	rf := raftLog{logData: []Entry{}, offset: 1, committed: 0, applying: 0, applied: 0, logger: logger}
+	return rf
 }
 
-func (l *logList) InstallSnapshot(index int, term int, snapshot []byte) bool {
-	if index <= l.LastIncludedIndex {
-		return false
+func (rl *raftLog) getIndex(i int) (int, error) {
+	entry, err := rl.get(i)
+	if err != nil {
+		return -1, err
 	}
-	l.LastIncludedIndex = index
-	l.LastIncludedTerm = term
+	return entry.Index, nil
+}
 
-	var newLog []*Entry
-	// 始终创建一个新的哨兵节点
-	sentinel := Entry{Command: nil, Index: index, Term: term}
-
-	keepOffset := index - l.Log[0].Index // 我需要快照包含的最后一条日志成为哨兵节点
-	if keepOffset < len(l.Log) && keepOffset >= 0 {
-		newLog = make([]*Entry, len(l.Log)-keepOffset)
-		copy(newLog, l.Log[keepOffset:])
-		newLog[0] = &sentinel
-	} else {
-		newLog = []*Entry{&sentinel}
-	}
-
-	l.Log = newLog
-	l.EndIndex = l.Log[len(l.Log)-1].Index
-	l.Size = len(l.Log)
-	l.Snapshot = snapshot
+func (rl *raftLog) installSnapshot(index int, term int, snapshot []byte) bool {
 	return true
 }
 
-func (l *logList) GetIndexTerm(index int) (int, error) {
-	if index < l.LastIncludedIndex || index > l.EndIndex {
-		err := fmt.Errorf("logIndex %d is not within snapshotted area (< LastIncludedIndex %d)",
-			index, l.LastIncludedIndex)
+func (rl *raftLog) getTerm(i int) (int, error) {
+	entry, err := rl.get(i)
+	if err != nil {
 		return -1, err
 	}
-	offset := index - l.Log[0].Index
-	if offset < 0 || offset >= len(l.Log) {
-		err := fmt.Errorf("internal error: offset %d (index %d) out of array bounds [0:%d]",
-			offset, index, len(l.Log))
-		return -1, err
+	return entry.Term, nil
+}
+
+func (rl *raftLog) get(i int) (Entry, error) {
+	index := i - rl.offset
+	if index < 0 || index >= len(rl.logData) {
+		return Entry{}, fmt.Errorf("目标日志不存在: %d", i)
 	}
-	return l.Log[offset].Term, nil
+	return rl.logData[index], nil
 }
 
-func (l *logList) Get(logIndex int) Entry {
-	if (logIndex - l.Log[0].Index) < 0 {
-		msg := fmt.Sprintf("logIndex: %d, l.BeginIndex: %d\n", logIndex, l.Log[0].Index)
-		fmt.Println(msg)
-		panic(msg)
+func (rl *raftLog) append(ents ...Entry) {
+	fromIndex := ents[0].Index
+	switch {
+	case fromIndex == rl.logData[len(rl.logData)-1].Index+1:
+		rl.logData = append(rl.logData, ents...)
+	case fromIndex <= rl.offset:
+		rl.logger.Info("所有日志均将被替换", zap.Int("fromIndex", fromIndex), zap.Int("endIndex", ents[len(ents)-1].Index))
+		rl.logData = ents
+		rl.offset = fromIndex
+	default:
+		rl.logger.Info("部分日志将被替换", zap.Int("fromIndex", fromIndex), zap.Int("endIndex", ents[len(ents)-1].Index))
+		rl.logData = append(rl.logData[:fromIndex-rl.offset], ents...)
 	}
-	return *l.Log[logIndex-l.Log[0].Index]
 }
 
-func (l *logList) Append(logs []*Entry) {
-	l.Log = append(l.Log, logs...)
-	l.EndIndex = l.Log[len(l.Log)-1].Index
-	l.Size = len(l.Log)
+func (rl *raftLog) endIndex() int {
+	return rl.logData[len(rl.logData)-1].Index
 }
 
-func (l *logList) AppendList(target int, logs []*Entry) error {
-	if target < l.LastIncludedIndex {
-		return fmt.Errorf("truncate index %d is within snapshotted area (< %d)", target, l.LastIncludedIndex)
-	}
-	offset := target - l.Log[0].Index
-	if offset < 0 || offset > l.Size {
-		return fmt.Errorf("truncate offset %d (index %d) out of array bounds [0:%d]", offset, target, len(l.Log))
-	}
-	l.Log = l.Log[:offset]
-	l.Append(logs)
-	return nil
-}
-
-func (l *logList) GetLast() Entry {
-	return *l.Log[len(l.Log)-1]
-}
-
-func (l *logList) GetBegin() Entry {
-	return *l.Log[0]
-}
-
-func (l *logList) GetSlice(begin, end int) []*Entry {
-	beginOffset := begin - l.Log[0].Index
-	if end == -1 {
-		return l.Log[beginOffset:]
-	}
-	endOffset := end - l.Log[0].Index
-	return l.Log[beginOffset:endOffset]
+func (rl *raftLog) endTerm() int {
+	return rl.logData[len(rl.logData)-1].Term
 }

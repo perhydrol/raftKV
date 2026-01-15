@@ -48,11 +48,10 @@ func (rf *Raft) logPrintf() *zap.Logger {
 	return rf.logger.With(
 		zap.Int64("Term", int64(rf.currentTerm)),
 		zap.String("State", stateStr),
-		zap.Int("LIdx", rf.log.EndIndex),
-		zap.Int64("LTerm", int64(rf.log.GetLast().Term)),
+		zap.Int("LIdx", rf.log.endIndex()),
+		zap.Int("LTerm", rf.log.endTerm()),
 		zap.Int("Commit", rf.commitIndex),
-		zap.Int("IncIdx", rf.log.LastIncludedIndex),
-		zap.Int64("IncTerm", int64(rf.log.LastIncludedTerm)),
+		zap.Int("Loffset", rf.log.offset),
 	)
 }
 
@@ -69,7 +68,7 @@ type Raft struct {
 	// state a Raft server must maintain.
 	currentTerm int
 	votedFor    int
-	log         logList
+	log         raftLog
 
 	commitIndex int
 	lastApplied int
@@ -269,7 +268,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
-
 	// Your initialization code here (3A, 3B, 3C).
 
 	// initialize from state persisted before a crash
