@@ -21,11 +21,7 @@ import (
 	"go.uber.org/zap/zapcore"
 )
 
-const (
-	leader int = iota
-	follower
-	candidate
-)
+type StateType int
 
 func (rf *Raft) initLogger() {
 	config := zap.NewProductionConfig()
