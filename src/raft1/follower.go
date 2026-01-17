@@ -50,9 +50,19 @@ type follower struct {
 	// 一个内部chan，用来唤醒send
 	weakup chan struct{}
 
-	logger *zap.Logger
-	ctx    context.Context
-	cancel context.CancelFunc
+	logger        *zap.Logger
+	rootCtx       context.Context
+	rootCtxCancel context.CancelFunc
+	subCtx        context.Context
+	subCtxCancel  context.CancelFunc
+}
+
+// 将rpc包装为一个chan
+func (f *follower) rpcChan(svcMeth string, args any, reply any) <-chan struct{} {
+	retChan := make(chan struct{})
+	for !f.call(svcMeth, args, reply) {
+	}
+	return retChan
 }
 
 func (f *follower) send() {
@@ -76,34 +86,38 @@ func (f *follower) send() {
 		}
 		f.mu.Unlock()
 
-		switch msg.(type) {
+		switch m := msg.(type) {
 		case SendLogArgs:
 			reply := SendLogReply{}
-			f.call("Raft.ReceiveLog", &msg, &reply)
+			select {
+			case <-f.rpcChan("Raft.ReceiveLog", &m, &reply):
+			case <-f.subCtx.Done():
+			}
 			r := resp{
 				followerId: f.followerId,
 				payload:    reply,
 			}
 			select {
 			case f.output <- r:
-			case <-f.ctx.Done():
+			case <-f.subCtx.Done():
 			}
 		case RequestVoteArgs:
 			reply := RequestVoteReply{}
-			f.call("Raft.RequestVote", &msg, &reply)
+			select {
+			case <-f.rpcChan("Raft.RequestVote", &m, &reply):
+			case <-f.subCtx.Done():
+			}
 			r := resp{
 				followerId: f.followerId,
 				payload:    reply,
 			}
 			select {
 			case f.output <- r:
-			case <-f.ctx.Done():
+			case <-f.subCtx.Done():
 			}
 		}
 	}
 }
-
-func (f *follower) recv()
 
 func (f *follower) HeartBeat(ent Entry) {
 	f.mu.Lock()
@@ -111,13 +125,13 @@ func (f *follower) HeartBeat(ent Entry) {
 	f.mu.Unlock()
 	select {
 	case f.weakup <- struct{}{}:
-	case <-f.ctx.Done():
+	case <-f.rootCtx.Done():
 	default:
 	}
 }
 
 func (f *follower) close() {
-	f.cancel()
+	f.rootCtxCancel()
 	close(f.weakup)
 	close(f.output)
 }
@@ -131,12 +145,13 @@ func (f *follower) sendMsg() {
 			f.mu.Unlock()
 			select {
 			case f.weakup <- struct{}{}:
-			case <-f.ctx.Done():
+			case <-f.rootCtx.Done():
 			default:
 			}
 		case StateType:
-			// TODO 暂停或激活所有leader线程
 			f.mu.Lock()
+			f.subCtxCancel()
+			f.subCtx, f.subCtxCancel = context.WithCancel(f.rootCtx)
 			switch m {
 			case isLeader:
 				f.status = isLeader
