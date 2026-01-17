@@ -52,6 +52,7 @@ type follower struct {
 
 	logger *zap.Logger
 	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 func (f *follower) send() {
@@ -83,7 +84,10 @@ func (f *follower) send() {
 				followerId: f.followerId,
 				payload:    reply,
 			}
-			f.output <- r
+			select {
+			case f.output <- r:
+			case <-f.ctx.Done():
+			}
 		case RequestVoteArgs:
 			reply := RequestVoteReply{}
 			f.call("Raft.RequestVote", &msg, &reply)
@@ -91,7 +95,10 @@ func (f *follower) send() {
 				followerId: f.followerId,
 				payload:    reply,
 			}
-			f.output <- r
+			select {
+			case f.output <- r:
+			case <-f.ctx.Done():
+			}
 		}
 	}
 }
@@ -104,13 +111,15 @@ func (f *follower) HeartBeat(ent Entry) {
 	f.mu.Unlock()
 	select {
 	case f.weakup <- struct{}{}:
+	case <-f.ctx.Done():
 	default:
 	}
 }
 
 func (f *follower) close() {
-	close(f.output)
+	f.cancel()
 	close(f.weakup)
+	close(f.output)
 }
 
 func (f *follower) sendMsg() {
@@ -122,6 +131,7 @@ func (f *follower) sendMsg() {
 			f.mu.Unlock()
 			select {
 			case f.weakup <- struct{}{}:
+			case <-f.ctx.Done():
 			default:
 			}
 		case StateType:
