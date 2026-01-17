@@ -23,6 +23,10 @@ import (
 
 type StateType int
 
+var isLeader StateType = 1
+var isFollower StateType = 2
+var isCandidate StateType = 3
+
 func (rf *Raft) initLogger() {
 	config := zap.NewProductionConfig()
 	config.DisableStacktrace = true
@@ -53,7 +57,7 @@ func (rf *Raft) logPrintf() *zap.Logger {
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
+	mu        sync.RWMutex        // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *tester.Persister   // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
@@ -72,7 +76,7 @@ type Raft struct {
 	nextIndex  []int
 	matchIndex []int
 
-	state int
+	state StateType
 
 	electionTimer *time.Timer
 	// Look at the paper's Figure 2 for a description of what
@@ -128,6 +132,31 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+}
+
+type coreStatus struct {
+	currentTerm int
+	votedFor    int
+
+	commitIndex int
+	lastApplied int
+
+	state StateType
+	me    int
+}
+
+func (rf *Raft) getRaftCoreStatus() coreStatus {
+	rf.mu.RLock()
+	defer rf.mu.RUnlock()
+	cs := coreStatus{
+		currentTerm: rf.currentTerm,
+		votedFor:    rf.votedFor,
+		commitIndex: rf.commitIndex,
+		lastApplied: rf.lastApplied,
+		state:       rf.state,
+		me:          rf.me,
+	}
+	return cs
 }
 
 // how many bytes in Raft's persisted log?
@@ -193,6 +222,22 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
+}
+
+type SendLogArgs struct {
+	Term         int
+	LeaderID     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	LeaderCommit int
+	Entries      Entry
+}
+
+type SendLogReply struct {
+}
+
+func (rf *Raft) ReceiveLog(args *SendLogArgs, reply *SendLogReply) {
+
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
