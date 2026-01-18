@@ -233,7 +233,6 @@ type SendLogArgs struct {
 	PrevLogIndex int
 	PrevLogTerm  int
 	LeaderCommit int
-	isHeartBeat  bool
 	Entries      Entry
 }
 

@@ -2,7 +2,6 @@ package raft
 
 import (
 	"context"
-	"math"
 	"sync"
 	"time"
 
@@ -93,7 +92,7 @@ func NewFollower(
 		getCoreLastIndex: getCoreLastIndex,
 		call:             call,
 		getCoreStatus:    getCoreStatus,
-		wakeup:           make(chan struct{}),
+		wakeup:           make(chan struct{}, 1),
 		input:            input,
 		logger:           logger,
 	}
@@ -106,20 +105,22 @@ func NewFollower(
 	return o
 }
 
-// 将rpc包装为一个chan
-func (f *follower) rpcChan(svcMeth string, args any, reply any) <-chan struct{} {
-	retChan := make(chan struct{})
+// 将rpc包装为一个chan，true为发送成功，false为发送失败
+func (f *follower) rpcChan(svcMeth string, args any, reply any) <-chan bool {
+	// 保留一个缓存以防止goroutine泄露
+	retChan := make(chan bool, 1)
 	go func() {
-		retryCount := float64(0)
+		retryCount := 0
 		for !f.call(svcMeth, args, reply) {
 			retryCount++
 			if retryCount >= 10.0 {
 				f.logger.Warn("rpc 请求发送失败")
-				break
+				retChan <- false
+				return
 			}
-			time.Sleep(time.Duration(math.Exp(retryCount)) * time.Millisecond)
+			time.Sleep(time.Duration(1<<retryCount) * time.Millisecond)
 		}
-		close(retChan)
+		retChan <- true
 	}()
 	return retChan
 }
@@ -180,7 +181,6 @@ func (f *follower) maybeSendAppend() bool {
 			PrevLogIndex: prevEntity.Index,
 			PrevLogTerm:  prevEntity.Term,
 			LeaderCommit: f.getCoreStatus().commitIndex,
-			isHeartBeat:  false,
 			Entries:      entity,
 		}
 		f.sentCommit = uint64(entity.Index)
@@ -191,47 +191,53 @@ func (f *follower) maybeSendAppend() bool {
 	}
 	f.mu.Unlock()
 
+	wrapCall := func(svcMeth string, args any, reply any) bool {
+		select {
+		case ok := <-f.rpcChan(svcMeth, args, reply):
+			if !ok {
+				return false
+			}
+		case <-f.subCtx.Done():
+			return false
+		}
+		r := resp{
+			followerId: f.followerId,
+			payload:    reply,
+		}
+		select {
+		case f.output <- r:
+		case <-f.subCtx.Done():
+			return false
+		}
+		return true
+	}
+
 	switch m := msg.(type) {
 	case SendLogArgs:
 		reply := SendLogReply{}
-		select {
-		case <-f.rpcChan("Raft.ReceiveLog", &m, &reply):
-		case <-f.subCtx.Done():
+		ok := wrapCall("Raft.ReceiveLog", &m, &reply)
+		if ok {
+			if reply.Success {
+				f.mu.Lock()
+				f.nextIndex = m.Entries.Index + 1
+				f.matchIndex = m.Entries.Index
+				f.mu.Unlock()
+			} else {
+				f.findConflict(m, reply)
+			}
 		}
-		r := resp{
-			followerId: f.followerId,
-			payload:    reply,
-		}
-		if reply.Success {
-			f.mu.Lock()
-			f.nextIndex = m.Entries.Index + 1
-			f.matchIndex = m.Entries.Index
-			f.mu.Unlock()
-		} else {
-			f.findConflict(m, reply)
-		}
-		select {
-		case f.output <- r:
-		case <-f.subCtx.Done():
-		}
+		// 再次检索发送，即便已经为空也无伤大雅
+		return true
 	case RequestVoteArgs:
 		reply := RequestVoteReply{}
-		select {
-		case <-f.rpcChan("Raft.RequestVote", &m, &reply):
-		case <-f.subCtx.Done():
-		}
-		r := resp{
-			followerId: f.followerId,
-			payload:    reply,
-		}
-		select {
-		case f.output <- r:
-		case <-f.subCtx.Done():
-		}
+		ok := wrapCall("Raft.RequestVote", &m, &reply)
+		return ok
 	case HeartBeatArgs:
 		// TODO
+		// 心跳发送失败，不再尝试
+		return false
 	}
-	return true
+	return false
 }
 
 func (f *follower) close(ctx context.Context) {
@@ -260,7 +266,7 @@ func (f *follower) sendMsg() {
 			case isLeader:
 				f.status = isLeader
 				f.term = m.term
-				f.nextIndex = m.leaderLastIndex
+				f.nextIndex = m.leaderLastIndex + 1
 				f.matchIndex = 0
 			case isCandidate:
 				f.status = isCandidate
