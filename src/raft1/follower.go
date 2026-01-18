@@ -233,7 +233,11 @@ func (f *follower) maybeSendAppend() bool {
 		ok := wrapCall("Raft.RequestVote", &m, &reply)
 		return ok
 	case HeartBeatArgs:
-		// TODO
+		reply := HeartBeatReply{}
+		ok := wrapCall("Raft.ReceiveLog", &m, &reply)
+		if ok && !reply.Success {
+			f.findConflict(m.SendLogArgs, reply.SendLogReply)
+		}
 		// 心跳发送失败，不再尝试
 		return false
 	}
@@ -278,6 +282,13 @@ func (f *follower) sendMsg() {
 				f.pendingLog = make([]any, 0, 10)
 			}
 			f.mu.Unlock()
+		case struct{}:
+			// 普通log
+			select {
+			case f.wakeup <- struct{}{}:
+			case <-f.rootCtx.Done():
+			default:
+			}
 		default:
 			f.logger.Panic("一个未知的类型")
 		}
