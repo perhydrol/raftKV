@@ -55,6 +55,9 @@ func (rf *Raft) logPrintf() *zap.Logger {
 	)
 }
 
+type HeartBeatArgs struct{}
+type HeartBeatReply struct{}
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.RWMutex        // Lock to protect shared access to this peer's state
@@ -230,10 +233,14 @@ type SendLogArgs struct {
 	PrevLogIndex int
 	PrevLogTerm  int
 	LeaderCommit int
+	isHeartBeat  bool
 	Entries      Entry
 }
 
 type SendLogReply struct {
+	Term    int
+	Success bool
+	NodeID  int
 }
 
 func (rf *Raft) ReceiveLog(args *SendLogArgs, reply *SendLogReply) {

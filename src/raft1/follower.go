@@ -2,7 +2,9 @@ package raft
 
 import (
 	"context"
+	"math"
 	"sync"
+	"time"
 
 	"go.uber.org/zap"
 )
@@ -12,8 +14,17 @@ type resp struct {
 	payload    any
 }
 
+type changeState struct {
+	from            StateType
+	to              StateType
+	term            int
+	leaderLastIndex int
+}
+
 type follower struct {
 	mu         sync.Mutex
+	me         int
+	term       int
 	nextIndex  int
 	matchIndex int
 	followerId int
@@ -27,7 +38,10 @@ type follower struct {
 	RecentActive bool
 
 	// 用来读取raft日志的接口
-	getIndex func(i int) (Entry, error)
+	getCoreLog func(i int) (Entry, error)
+
+	// 获取raft core目前最新的日志
+	getCoreLastIndex func() Entry
 
 	// 存储发送数据rpc接口，注意参数需要是指针类型
 	call func(svcMeth string, args any, reply any) bool
@@ -37,18 +51,17 @@ type follower struct {
 
 	getCoreStatus func() coreStatus
 
-	// 存储等待发送的请求
+	// 存储等待发送的非日志请求（心跳、拉票）
 	pendingLog []any
 
-	// 每次尝试发送log之前将首先发送心跳并清空
-	// 每次更新时直接替换
-	heartBeat *Entry
+	// 传入拉票请求、心跳、新日志信号
+	input <-chan any
 
-	input  <-chan any
-	output chan<- any
+	// 将 grpc reply 返回给 core
+	output chan<- resp
 
 	// 一个内部chan，用来唤醒send
-	weakup chan struct{}
+	wakeup chan struct{}
 
 	logger        *zap.Logger
 	rootCtx       context.Context
@@ -57,111 +70,205 @@ type follower struct {
 	subCtxCancel  context.CancelFunc
 }
 
+// 返回一个chan用来接受follower的reply
+func NewFollower(
+	ctx context.Context,
+	me, term, nextIndex, matchIndex, followerId int,
+	getCoreLog func(i int) (Entry, error),
+	getCoreLastIndex func() Entry,
+	call func(svcMeth string, args any, reply any) bool,
+	getCoreStatus func() coreStatus,
+	input <-chan any,
+	logger *zap.Logger,
+) <-chan resp {
+	o := make(chan resp)
+	f := follower{
+		mu:               sync.Mutex{},
+		me:               me,
+		term:             term,
+		nextIndex:        nextIndex,
+		matchIndex:       matchIndex,
+		followerId:       followerId,
+		getCoreLog:       getCoreLog,
+		getCoreLastIndex: getCoreLastIndex,
+		call:             call,
+		getCoreStatus:    getCoreStatus,
+		wakeup:           make(chan struct{}),
+		input:            input,
+		logger:           logger,
+	}
+	f.rootCtx, f.rootCtxCancel = context.WithCancel(ctx)
+	f.subCtx, f.subCtxCancel = context.WithCancel(f.rootCtx)
+	f.output = o
+	go f.sendMsg()
+	go f.send()
+	go f.close(ctx)
+	return o
+}
+
 // 将rpc包装为一个chan
 func (f *follower) rpcChan(svcMeth string, args any, reply any) <-chan struct{} {
 	retChan := make(chan struct{})
-	for !f.call(svcMeth, args, reply) {
-	}
+	go func() {
+		retryCount := float64(0)
+		for !f.call(svcMeth, args, reply) {
+			retryCount++
+			if retryCount >= 10.0 {
+				f.logger.Warn("rpc 请求发送失败")
+				break
+			}
+			time.Sleep(time.Duration(math.Exp(retryCount)) * time.Millisecond)
+		}
+		close(retChan)
+	}()
 	return retChan
 }
 
 func (f *follower) send() {
-	for range f.weakup {
-		var msg any
-		f.mu.Lock()
-		switch {
-		case f.heartBeat != nil:
-			msg = *f.heartBeat
-			f.heartBeat = nil
-		case len(f.pendingLog) != 0:
-			msg = f.pendingLog[0]
-			f.pendingLog = f.pendingLog[1:]
-
-			// 释放内存：网络之前可能发生拥堵导致大量日志堆积，现在缓存被清空说明网络正常，可以释放占用的内存
-			if len(f.pendingLog) == 0 && cap(f.pendingLog) >= 100 {
-				f.pendingLog = make([]any, 0, 10)
-			}
-		default:
-			f.logger.Warn("follower的发送函数被唤醒，但没有消息可发")
-		}
-		f.mu.Unlock()
-
-		switch m := msg.(type) {
-		case SendLogArgs:
-			reply := SendLogReply{}
-			select {
-			case <-f.rpcChan("Raft.ReceiveLog", &m, &reply):
-			case <-f.subCtx.Done():
-			}
-			r := resp{
-				followerId: f.followerId,
-				payload:    reply,
-			}
-			select {
-			case f.output <- r:
-			case <-f.subCtx.Done():
-			}
-		case RequestVoteArgs:
-			reply := RequestVoteReply{}
-			select {
-			case <-f.rpcChan("Raft.RequestVote", &m, &reply):
-			case <-f.subCtx.Done():
-			}
-			r := resp{
-				followerId: f.followerId,
-				payload:    reply,
-			}
-			select {
-			case f.output <- r:
-			case <-f.subCtx.Done():
-			}
+	for range f.wakeup {
+		for f.maybeSendAppend() {
 		}
 	}
 }
 
-func (f *follower) HeartBeat(ent Entry) {
+func (f *follower) findConflict(arg SendLogArgs, reply SendLogReply) {
 	f.mu.Lock()
-	f.heartBeat = &ent
-	f.mu.Unlock()
-	select {
-	case f.weakup <- struct{}{}:
-	case <-f.rootCtx.Done():
-	default:
+	defer f.mu.Unlock()
+
+	// 首先确定是否需要处理冲突，如果任期不一致，将情况交给core判断
+	if reply.Term == f.term {
+		// TODO 需要实现快速回退逻辑
+		f.nextIndex = arg.PrevLogIndex - 1
 	}
 }
 
-func (f *follower) close() {
-	f.rootCtxCancel()
-	close(f.weakup)
+// 尝试排空待发送队列，返回 true 表明成功取得数据并发送，返回 false 表示队列为空
+func (f *follower) maybeSendAppend() bool {
+	var msg any
+	f.mu.Lock()
+	if f.status == isFollower {
+		f.mu.Unlock()
+		return false
+	}
+	switch {
+	// 存在特殊信息需要发送
+	case len(f.pendingLog) != 0:
+		msg = f.pendingLog[0]
+		f.pendingLog = f.pendingLog[1:]
+
+		// 释放内存：网络之前可能发生拥堵导致大量日志堆积，现在缓存被清空说明网络正常，可以释放占用的内存
+		if len(f.pendingLog) == 0 && cap(f.pendingLog) >= 100 {
+			f.pendingLog = make([]any, 0, 10)
+		}
+	// 存在需要同步的日志
+	case f.getCoreLastIndex().Index >= f.nextIndex:
+		prevEntity, err := f.getCoreLog(f.nextIndex - 1)
+		if err != nil {
+			f.logger.Error("无法获取日志", zap.Error(err))
+			f.mu.Unlock()
+			return false
+		}
+		entity, err := f.getCoreLog(f.nextIndex)
+		if err != nil {
+			f.logger.Error("无法获取日志", zap.Error(err))
+			f.mu.Unlock()
+			return false
+		}
+		msg = SendLogArgs{
+			Term:         f.term,
+			LeaderID:     f.me,
+			PrevLogIndex: prevEntity.Index,
+			PrevLogTerm:  prevEntity.Term,
+			LeaderCommit: f.getCoreStatus().commitIndex,
+			isHeartBeat:  false,
+			Entries:      entity,
+		}
+		f.sentCommit = uint64(entity.Index)
+	default:
+		f.logger.Info("follower的发送函数被唤醒，但没有消息可发")
+		f.mu.Unlock()
+		return false
+	}
+	f.mu.Unlock()
+
+	switch m := msg.(type) {
+	case SendLogArgs:
+		reply := SendLogReply{}
+		select {
+		case <-f.rpcChan("Raft.ReceiveLog", &m, &reply):
+		case <-f.subCtx.Done():
+		}
+		r := resp{
+			followerId: f.followerId,
+			payload:    reply,
+		}
+		if reply.Success {
+			f.mu.Lock()
+			f.nextIndex = m.Entries.Index + 1
+			f.matchIndex = m.Entries.Index
+			f.mu.Unlock()
+		} else {
+			f.findConflict(m, reply)
+		}
+		select {
+		case f.output <- r:
+		case <-f.subCtx.Done():
+		}
+	case RequestVoteArgs:
+		reply := RequestVoteReply{}
+		select {
+		case <-f.rpcChan("Raft.RequestVote", &m, &reply):
+		case <-f.subCtx.Done():
+		}
+		r := resp{
+			followerId: f.followerId,
+			payload:    reply,
+		}
+		select {
+		case f.output <- r:
+		case <-f.subCtx.Done():
+		}
+	case HeartBeatArgs:
+		// TODO
+	}
+	return true
+}
+
+func (f *follower) close(ctx context.Context) {
+	<-ctx.Done()
+	close(f.wakeup)
 	close(f.output)
 }
 
 func (f *follower) sendMsg() {
 	for msg := range f.input {
 		switch m := msg.(type) {
-		case Entry:
+		case RequestVoteArgs, HeartBeatArgs:
 			f.mu.Lock()
 			f.pendingLog = append(f.pendingLog, m)
 			f.mu.Unlock()
 			select {
-			case f.weakup <- struct{}{}:
+			case f.wakeup <- struct{}{}:
 			case <-f.rootCtx.Done():
 			default:
 			}
-		case StateType:
+		case changeState:
 			f.mu.Lock()
 			f.subCtxCancel()
 			f.subCtx, f.subCtxCancel = context.WithCancel(f.rootCtx)
-			switch m {
+			switch m.to {
 			case isLeader:
 				f.status = isLeader
+				f.term = m.term
+				f.nextIndex = m.leaderLastIndex
+				f.matchIndex = 0
 			case isCandidate:
 				f.status = isCandidate
-				f.heartBeat = nil
+				f.term = m.term
 				f.pendingLog = make([]any, 0, 10)
 			case isFollower:
 				f.status = isFollower
-				f.heartBeat = nil
+				f.term = m.term
 				f.pendingLog = make([]any, 0, 10)
 			}
 			f.mu.Unlock()
