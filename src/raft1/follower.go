@@ -264,7 +264,7 @@ func (f *follower) sendMsg() {
 			case isLeader:
 				f.status = isLeader
 				f.term = m.term
-				f.nextIndex = m.leaderLastIndex + 1
+				f.nextIndex = f.getCoreLastIndex() + 1
 				f.matchIndex = 0
 			case isCandidate:
 				f.status = isCandidate
