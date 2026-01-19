@@ -8,7 +8,7 @@ package raft
 
 import (
 	//	"bytes"
-	"math/rand"
+	"context"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -27,12 +27,15 @@ var isLeader StateType = 1
 var isFollower StateType = 2
 var isCandidate StateType = 3
 
-func (rf *Raft) initLogger() {
+var heartBeatTick time.Duration = 300 * time.Millisecond
+var electionTick time.Duration = 1000 * time.Millisecond
+
+func initLogger(me int) *zap.Logger {
 	config := zap.NewProductionConfig()
 	config.DisableStacktrace = true
 	config.EncoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
 	l, _ := config.Build()
-	rf.logger = l.With(zap.Int("Srv", rf.me))
+	return l.With(zap.Int("Srv", me))
 }
 
 func (rf *Raft) logPrintf() *zap.Logger {
@@ -55,6 +58,33 @@ func (rf *Raft) logPrintf() *zap.Logger {
 	)
 }
 
+type ticker struct {
+	t        *time.Ticker
+	interval time.Duration
+}
+
+func initTicker(outTime time.Duration) ticker {
+	return ticker{t: time.NewTicker(outTime), interval: outTime}
+}
+
+func (t *ticker) reset() {
+	t.t.Stop()
+	select {
+	case <-t.t.C:
+	default:
+	}
+	t.t.Reset(t.interval)
+}
+
+func (t *ticker) newOutTime(o time.Duration) {
+	t.interval = o
+	t.reset()
+}
+
+func (t *ticker) tick() <-chan time.Time {
+	return t.t.C
+}
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.RWMutex        // Lock to protect shared access to this peer's state
@@ -73,17 +103,23 @@ type Raft struct {
 	commitIndex int
 	lastApplied int
 
-	nextIndex  []int
-	matchIndex []int
-
 	state StateType
 
-	electionTimer *time.Timer
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 	applyCh chan raftapi.ApplyMsg
 
-	logger *zap.Logger
+	logger    *zap.Logger
+	ctx       context.Context
+	ctxCancel context.CancelFunc
+
+	// 用来向所有follower传递信号
+	sendToFollowers chan<- any
+
+	// 用于接受所有follower的返回信号
+	followerResp <-chan resp
+
+	ticker ticker
 }
 
 // return currentTerm and whether this server
@@ -240,6 +276,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	return index, term, isLeader
 }
 
+func (rf *Raft) tickOutData() {}
+
 // the tester doesn't halt goroutines created by Raft after each test,
 // but it does call the Kill() method. your code can use killed() to
 // check whether Kill() has been called. the use of atomic avoids the
@@ -252,6 +290,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	rf.ctxCancel()
 }
 
 func (rf *Raft) killed() bool {
@@ -259,16 +298,14 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-func (rf *Raft) ticker() {
-	for rf.killed() == false {
-
-		// Your code here (3A)
-		// Check if a leader election should be started.
-
-		// pause for a random amount of time between 50 and 350
-		// milliseconds.
-		ms := 50 + (rand.Int63() % 300)
-		time.Sleep(time.Duration(ms) * time.Millisecond)
+func (rf *Raft) run() {
+	for {
+		select {
+		case <-rf.ticker.tick():
+			rf.tickOutData()
+		case <-rf.ctx.Done():
+			return
+		}
 	}
 }
 
@@ -283,17 +320,82 @@ func (rf *Raft) ticker() {
 // for any long-running work.
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *tester.Persister, applyCh chan raftapi.ApplyMsg) raftapi.Raft {
-	rf := &Raft{}
-	rf.peers = peers
-	rf.persister = persister
-	rf.me = me
+	rf := &Raft{
+		peers:     peers,
+		persister: persister,
+		me:        me,
+		mu:        sync.RWMutex{},
+
+		currentTerm: 0,
+		votedFor:    -1,
+
+		commitIndex: 0,
+		lastApplied: 0,
+
+		state: isFollower,
+
+		applyCh: applyCh,
+
+		logger: initLogger(me),
+		ticker: initTicker(electionTick),
+	}
+	rf.ctx, rf.ctxCancel = context.WithCancel(context.Background())
+	rf.log = newRaftLog(rf.logger)
+
+	sub := make([]chan any, len(peers))
+	sendToFollowers := make(chan any)
+	followerResp := make(chan resp, len(peers))
+	rf.sendToFollowers = sendToFollowers
+	rf.followerResp = followerResp
+
+	go broadcast(rf.ctx, sendToFollowers, sub)
 	// Your initialization code here (3A, 3B, 3C).
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
-	go rf.ticker()
+	go rf.run()
+
+	for i := range peers {
+		if i == me {
+			continue
+		}
+		NewFollower(
+			rf.ctx,
+			me,
+			0,
+			1,
+			0,
+			i,
+			rf.log.get,
+			rf.log.endIndex,
+			rf.peers[i].Call,
+			rf.getRaftCoreStatus,
+			sub[i],
+			followerResp,
+			rf.logger,
+		)
+	}
 
 	return rf
+}
+
+func broadcast(ctx context.Context, put <-chan any, sub []chan any) {
+	defer func() {
+		for i := range sub {
+			close(sub[i])
+		}
+	}()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case msg := <-put:
+			// sub中的接受chan是无阻塞的
+			for i := range sub {
+				sub[i] <- msg
+			}
+		}
+	}
 }

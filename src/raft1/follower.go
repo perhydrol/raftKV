@@ -20,6 +20,8 @@ type changeState struct {
 	leaderLastIndex int
 }
 
+type newLog struct{}
+
 type follower struct {
 	mu         sync.Mutex
 	me         int
@@ -39,8 +41,8 @@ type follower struct {
 	// 用来读取raft日志的接口
 	getCoreLog func(i int) (Entry, error)
 
-	// 获取raft core目前最新的日志
-	getCoreLastIndex func() Entry
+	// 获取raft core目前最新的日志index
+	getCoreLastIndex func() int
 
 	// 存储发送数据rpc接口，注意参数需要是指针类型
 	call func(svcMeth string, args any, reply any) bool
@@ -74,13 +76,13 @@ func NewFollower(
 	ctx context.Context,
 	me, term, nextIndex, matchIndex, followerId int,
 	getCoreLog func(i int) (Entry, error),
-	getCoreLastIndex func() Entry,
+	getCoreLastIndex func() int,
 	call func(svcMeth string, args any, reply any) bool,
 	getCoreStatus func() coreStatus,
 	input <-chan any,
+	output chan<- resp,
 	logger *zap.Logger,
-) <-chan resp {
-	o := make(chan resp)
+) {
 	f := follower{
 		mu:               sync.Mutex{},
 		me:               me,
@@ -94,15 +96,14 @@ func NewFollower(
 		getCoreStatus:    getCoreStatus,
 		wakeup:           make(chan struct{}, 1),
 		input:            input,
+		output:           output,
 		logger:           logger,
 	}
 	f.rootCtx, f.rootCtxCancel = context.WithCancel(ctx)
 	f.subCtx, f.subCtxCancel = context.WithCancel(f.rootCtx)
-	f.output = o
 	go f.sendMsg()
 	go f.send()
 	go f.close(ctx)
-	return o
 }
 
 // 将rpc包装为一个chan，true为发送成功，false为发送失败
@@ -162,7 +163,7 @@ func (f *follower) maybeSendAppend() bool {
 			f.pendingLog = make([]any, 0, 10)
 		}
 	// 存在需要同步的日志
-	case f.getCoreLastIndex().Index >= f.nextIndex:
+	case f.getCoreLastIndex() >= f.nextIndex:
 		prevEntity, err := f.getCoreLog(f.nextIndex - 1)
 		if err != nil {
 			f.logger.Error("无法获取日志", zap.Error(err))
@@ -282,7 +283,7 @@ func (f *follower) sendMsg() {
 				f.pendingLog = make([]any, 0, 10)
 			}
 			f.mu.Unlock()
-		case struct{}:
+		case newLog:
 			// 普通log
 			select {
 			case f.wakeup <- struct{}{}:

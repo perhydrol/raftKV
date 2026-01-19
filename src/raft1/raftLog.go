@@ -2,6 +2,7 @@ package raft
 
 import (
 	"fmt"
+	"sync"
 
 	"go.uber.org/zap"
 )
@@ -13,6 +14,7 @@ type Entry struct {
 }
 
 type raftLog struct {
+	mu        sync.RWMutex
 	logData   []Entry
 	offset    int // 未安装快照时为1,安装完成后为快照最后一个index+1.
 	committed uint64
@@ -29,11 +31,13 @@ type raftLog struct {
 }
 
 func newRaftLog(logger *zap.Logger) raftLog {
-	rf := raftLog{logData: []Entry{}, offset: 1, committed: 0, applying: 0, applied: 0, logger: logger}
+	rf := raftLog{mu: sync.RWMutex{}, logData: []Entry{}, offset: 1, committed: 0, applying: 0, applied: 0, logger: logger}
 	return rf
 }
 
 func (rl *raftLog) getIndex(i int) (int, error) {
+	rl.mu.RLock()
+	defer rl.mu.RUnlock()
 	entry, err := rl.get(i)
 	if err != nil {
 		return -1, err
@@ -42,10 +46,15 @@ func (rl *raftLog) getIndex(i int) (int, error) {
 }
 
 func (rl *raftLog) installSnapshot(index int, term int, snapshot []byte) bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
 	return true
 }
 
+// 获取指定index log的任期
 func (rl *raftLog) getTerm(i int) (int, error) {
+	rl.mu.RLock()
+	defer rl.mu.RUnlock()
 	entry, err := rl.get(i)
 	if err != nil {
 		return -1, err
@@ -54,6 +63,8 @@ func (rl *raftLog) getTerm(i int) (int, error) {
 }
 
 func (rl *raftLog) get(i int) (Entry, error) {
+	rl.mu.RLock()
+	defer rl.mu.RUnlock()
 	index := i - rl.offset
 	if index < 0 || index >= len(rl.logData) {
 		return Entry{}, fmt.Errorf("目标日志不存在: %d", i)
@@ -62,6 +73,8 @@ func (rl *raftLog) get(i int) (Entry, error) {
 }
 
 func (rl *raftLog) append(ents ...Entry) {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
 	fromIndex := ents[0].Index
 	switch {
 	case fromIndex == rl.logData[len(rl.logData)-1].Index+1:
@@ -77,9 +90,13 @@ func (rl *raftLog) append(ents ...Entry) {
 }
 
 func (rl *raftLog) endIndex() int {
+	rl.mu.RLock()
+	defer rl.mu.RUnlock()
 	return rl.logData[len(rl.logData)-1].Index
 }
 
 func (rl *raftLog) endTerm() int {
+	rl.mu.RLock()
+	defer rl.mu.RUnlock()
 	return rl.logData[len(rl.logData)-1].Term
 }
