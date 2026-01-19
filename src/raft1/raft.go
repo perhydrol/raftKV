@@ -28,9 +28,10 @@ var isLeader StateType = 1
 var isFollower StateType = 2
 var isCandidate StateType = 3
 
-var heartBeatTick time.Duration = 300 * time.Millisecond
-
-func electionTick() time.Duration { return time.Duration(1000+rand.Intn(500)) * time.Millisecond }
+const (
+	heartBeatTick = 200
+	electionTick  = 1000
+)
 
 type changeState struct {
 	from StateType
@@ -69,11 +70,11 @@ func (rf *Raft) logPrintf() *zap.Logger {
 type ticker struct {
 	mu       sync.Mutex
 	t        *time.Ticker
-	interval time.Duration
+	interval int
 }
 
-func initTicker(outTime time.Duration) ticker {
-	return ticker{mu: sync.Mutex{}, t: time.NewTicker(outTime), interval: outTime}
+func initTicker(outTime int) ticker {
+	return ticker{mu: sync.Mutex{}, t: time.NewTicker(time.Duration(outTime+rand.Intn(500)) * time.Millisecond), interval: outTime}
 }
 
 func (t *ticker) reset() {
@@ -84,10 +85,10 @@ func (t *ticker) reset() {
 	case <-t.t.C:
 	default:
 	}
-	t.t.Reset(t.interval)
+	t.t.Reset(time.Duration(t.interval+rand.Intn(500)) * time.Millisecond)
 }
 
-func (t *ticker) newOutTime(o time.Duration) {
+func (t *ticker) newOutTime(o int) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.t.Stop()
@@ -96,7 +97,7 @@ func (t *ticker) newOutTime(o time.Duration) {
 	default:
 	}
 	t.interval = o
-	t.t.Reset(t.interval)
+	t.t.Reset(time.Duration(t.interval+rand.Intn(500)) * time.Millisecond)
 }
 
 func (t *ticker) tick() <-chan time.Time {
@@ -120,6 +121,9 @@ type Raft struct {
 
 	commitIndex int
 	lastApplied int
+
+	// 用来统计选票，每次term更新记得归零
+	getVoteCount int
 
 	state StateType
 
@@ -274,6 +278,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1 // 任期变了，选票需要重置
+		rf.getVoteCount = 0
 		if rf.state != isFollower {
 			cs = &changeState{
 				from: rf.state,
@@ -282,8 +287,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			}
 			rf.state = isFollower
 		}
-		rf.persist()      // 状态改变，必须持久化
-		rf.ticker.reset() // 即便不投票，当集群存在较新的term时也需要重置记时器
+		rf.persist()                       // 状态改变，必须持久化
+		rf.ticker.newOutTime(electionTick) // 即便不投票，当集群存在较新的term时也需要重置记时器
 	}
 
 	reply.Term = rf.currentTerm
@@ -310,7 +315,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		}
 		rf.persist() // 先持久化，再回复！
 
-		rf.ticker.reset()
+		rf.ticker.newOutTime(electionTick)
 
 		reply.VoteGranted = true
 		rf.logPrintf().Info("投票成功", zap.Int("Candidate", args.CandidateID), zap.Int("Term", args.Term))
@@ -412,9 +417,19 @@ func (rf *Raft) killed() bool {
 
 func (rf *Raft) election() {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	rf.logPrintf().Info("开启选举")
+	rf.votedFor = rf.me
 	rf.currentTerm++
+	rf.getVoteCount = 1
+	requestVote := RequestVoteArgs{
+		Term:         rf.currentTerm,
+		CandidateID:  rf.me,
+		LastLogIndex: rf.log.endIndex(),
+		LastLogTerm:  rf.log.endTerm(),
+	}
+	rf.state = isCandidate
+	rf.logPrintf().Info("开启选举")
+	rf.mu.Unlock()
+	rf.sendToFollowers <- requestVote
 }
 
 func (rf *Raft) run() {
@@ -422,6 +437,51 @@ func (rf *Raft) run() {
 		select {
 		case <-rf.ticker.tick():
 			rf.tickOutTime()
+		case msg := <-rf.selfChan:
+			switch m := msg.(type) {
+			case changeState:
+				if (m.from == isCandidate && m.to == isCandidate) || (m.from != m.to) {
+					rf.sendToFollowers <- m
+				}
+			}
+		case msg := <-rf.followerResp:
+			switch m := msg.payload.(type) {
+			case RequestVoteReply:
+				if rf.state == isCandidate {
+					rf.mu.Lock()
+					if m.Term == rf.currentTerm {
+						if m.VoteGranted {
+							rf.getVoteCount++
+							if rf.getVoteCount > len(rf.peers)/2 {
+								rf.logPrintf().Info("成为领导者节点")
+								rf.state = isLeader
+								rf.sendToFollowers <- changeState{
+									from: isCandidate,
+									to:   isLeader,
+									term: rf.currentTerm,
+								}
+								rf.ticker.newOutTime(heartBeatTick)
+								// TODO 生成空log
+							}
+						} else {
+							if m.Term > rf.currentTerm {
+								rf.currentTerm = m.Term
+								rf.votedFor = -1 // 任期变了，选票需要重置
+								rf.getVoteCount = 0
+								rf.state = isFollower
+								rf.sendToFollowers <- changeState{
+									from: isCandidate,
+									to:   isFollower,
+									term: rf.currentTerm,
+								}
+								rf.persist() // 状态改变，必须持久化
+								rf.ticker.newOutTime(electionTick)
+							}
+						}
+					}
+					rf.mu.Unlock()
+				}
+			}
 		case <-rf.ctx.Done():
 			return
 		}
@@ -456,7 +516,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		applyCh: applyCh,
 
 		logger: initLogger(me),
-		ticker: initTicker(electionTick()),
+		ticker: initTicker(electionTick),
 	}
 	rf.logPrintf().Info("raft core启动")
 	rf.ctx, rf.ctxCancel = context.WithCancel(context.Background())
