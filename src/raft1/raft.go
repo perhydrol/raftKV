@@ -9,6 +9,7 @@ package raft
 import (
 	//	"bytes"
 	"context"
+	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -28,7 +29,14 @@ var isFollower StateType = 2
 var isCandidate StateType = 3
 
 var heartBeatTick time.Duration = 300 * time.Millisecond
-var electionTick time.Duration = 1000 * time.Millisecond
+
+func electionTick() time.Duration { return time.Duration(1000+rand.Intn(500)) * time.Millisecond }
+
+type changeState struct {
+	from StateType
+	to   StateType
+	term int
+}
 
 func initLogger(me int) *zap.Logger {
 	config := zap.NewProductionConfig()
@@ -51,7 +59,7 @@ func (rf *Raft) logPrintf() *zap.Logger {
 	return rf.logger.With(
 		zap.Int64("Term", int64(rf.currentTerm)),
 		zap.String("State", stateStr),
-		zap.Int("LIdx", rf.log.endIndex()),
+		zap.Int("LIDx", rf.log.endIndex()),
 		zap.Int("LTerm", rf.log.endTerm()),
 		zap.Int("Commit", rf.commitIndex),
 		zap.Int("Loffset", rf.log.offset),
@@ -59,15 +67,18 @@ func (rf *Raft) logPrintf() *zap.Logger {
 }
 
 type ticker struct {
+	mu       sync.Mutex
 	t        *time.Ticker
 	interval time.Duration
 }
 
 func initTicker(outTime time.Duration) ticker {
-	return ticker{t: time.NewTicker(outTime), interval: outTime}
+	return ticker{mu: sync.Mutex{}, t: time.NewTicker(outTime), interval: outTime}
 }
 
 func (t *ticker) reset() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.t.Stop()
 	select {
 	case <-t.t.C:
@@ -77,8 +88,15 @@ func (t *ticker) reset() {
 }
 
 func (t *ticker) newOutTime(o time.Duration) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.t.Stop()
+	select {
+	case <-t.t.C:
+	default:
+	}
 	t.interval = o
-	t.reset()
+	t.t.Reset(t.interval)
 }
 
 func (t *ticker) tick() <-chan time.Time {
@@ -118,6 +136,9 @@ type Raft struct {
 
 	// 用于接受所有follower的返回信号
 	followerResp <-chan resp
+
+	// 用来处理自身的信号
+	selfChan chan any
 
 	ticker ticker
 }
@@ -215,17 +236,85 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (3A, 3B).
+	Term         int
+	CandidateID  int
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (3A).
+	VoteGranted bool
+	Term        int
 }
 
-// example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (3A, 3B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	var cs *changeState //如果投票请求导致节点状态变化，需要通知follower管理器
+	defer func() {
+		if cs != nil {
+			rf.selfChan <- cs
+		}
+	}()
+	// 默认回复
+	reply.VoteGranted = false
+	reply.Term = rf.currentTerm
+
+	if args.Term < rf.currentTerm {
+		return
+	}
+
+	// 处理更高任期 (变为 Follower)
+	// 注意：即使 args.Term > currentTerm，我们也不一定投票给它（还需要检查日志）
+	// 但我们需要更新自己的任期状态
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.votedFor = -1 // 任期变了，选票需要重置
+		if rf.state != isFollower {
+			cs = &changeState{
+				from: rf.state,
+				to:   isFollower,
+				term: rf.currentTerm,
+			}
+			rf.state = isFollower
+		}
+		rf.persist()      // 状态改变，必须持久化
+		rf.ticker.reset() // 即便不投票，当集群存在较新的term时也需要重置记时器
+	}
+
+	reply.Term = rf.currentTerm
+
+	// 检查日志是否足够新 (Log Matching Property)
+	// 定义：最后一条日志任期更大，或者任期相同但在索引上更长
+	lastLogIndex := rf.log.endIndex()
+	lastLogTerm := rf.log.endTerm()
+
+	isLogUpToDate := (args.LastLogTerm > lastLogTerm) ||
+		(args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex)
+
+	// 决定是否投票
+	// 条件：(没投过票或已经投给了这个人) 并且日志足够新
+	if (rf.votedFor == -1 || rf.votedFor == args.CandidateID) && isLogUpToDate {
+		rf.votedFor = args.CandidateID
+		if rf.state != isFollower {
+			cs = &changeState{
+				from: rf.state,
+				to:   isFollower,
+				term: rf.currentTerm,
+			}
+			rf.state = isFollower
+		}
+		rf.persist() // 先持久化，再回复！
+
+		rf.ticker.reset()
+
+		reply.VoteGranted = true
+		rf.logPrintf().Info("投票成功", zap.Int("Candidate", args.CandidateID), zap.Int("Term", args.Term))
+	}
 }
 
 type SendLogArgs struct {
@@ -276,7 +365,30 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	return index, term, isLeader
 }
 
-func (rf *Raft) tickOutData() {}
+func (rf *Raft) tickOutTime() {
+	rf.mu.RLock()
+	switch rf.state {
+	case isLeader:
+		msg := HeartBeatArgs{
+			SendLogArgs: SendLogArgs{
+				Term:         rf.currentTerm,
+				LeaderID:     rf.me,
+				PrevLogIndex: rf.log.endIndex(),
+				PrevLogTerm:  rf.log.endTerm(),
+				LeaderCommit: rf.commitIndex,
+				Entries:      Entry{},
+			},
+		}
+		rf.logPrintf().Info("发送心跳")
+		rf.mu.RUnlock()
+		rf.sendToFollowers <- msg
+		rf.ticker.reset()
+	case isCandidate, isFollower:
+		rf.mu.RUnlock()
+		rf.ticker.reset()
+		rf.election()
+	}
+}
 
 // the tester doesn't halt goroutines created by Raft after each test,
 // but it does call the Kill() method. your code can use killed() to
@@ -298,11 +410,18 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+func (rf *Raft) election() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.logPrintf().Info("开启选举")
+	rf.currentTerm++
+}
+
 func (rf *Raft) run() {
 	for {
 		select {
 		case <-rf.ticker.tick():
-			rf.tickOutData()
+			rf.tickOutTime()
 		case <-rf.ctx.Done():
 			return
 		}
@@ -337,8 +456,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		applyCh: applyCh,
 
 		logger: initLogger(me),
-		ticker: initTicker(electionTick),
+		ticker: initTicker(electionTick()),
 	}
+	rf.logPrintf().Info("raft core启动")
 	rf.ctx, rf.ctxCancel = context.WithCancel(context.Background())
 	rf.log = newRaftLog(rf.logger)
 

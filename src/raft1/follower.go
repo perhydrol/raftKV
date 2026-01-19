@@ -13,13 +13,6 @@ type resp struct {
 	payload    any
 }
 
-type changeState struct {
-	from            StateType
-	to              StateType
-	term            int
-	leaderLastIndex int
-}
-
 type newLog struct{}
 
 type follower struct {
