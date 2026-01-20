@@ -24,9 +24,11 @@ import (
 
 type StateType int
 
-var isLeader StateType = 1
-var isFollower StateType = 2
-var isCandidate StateType = 3
+const (
+	isFollower  StateType = iota // 0
+	isCandidate                  // 1
+	isLeader                     // 2
+)
 
 const (
 	heartBeatTick = 200
@@ -74,7 +76,7 @@ type ticker struct {
 }
 
 func initTicker(outTime int) ticker {
-	return ticker{mu: sync.Mutex{}, t: time.NewTicker(time.Duration(outTime+rand.Intn(500)) * time.Millisecond), interval: outTime}
+	return ticker{mu: sync.Mutex{}, t: time.NewTicker(time.Duration(outTime+rand.Intn(200)) * time.Millisecond), interval: outTime}
 }
 
 func (t *ticker) reset() {
@@ -85,7 +87,7 @@ func (t *ticker) reset() {
 	case <-t.t.C:
 	default:
 	}
-	t.t.Reset(time.Duration(t.interval+rand.Intn(500)) * time.Millisecond)
+	t.t.Reset(time.Duration(t.interval+rand.Intn(200)) * time.Millisecond)
 }
 
 func (t *ticker) newOutTime(o int) {
@@ -97,7 +99,7 @@ func (t *ticker) newOutTime(o int) {
 	default:
 	}
 	t.interval = o
-	t.t.Reset(time.Duration(t.interval+rand.Intn(500)) * time.Millisecond)
+	t.t.Reset(time.Duration(t.interval+rand.Intn(200)) * time.Millisecond)
 }
 
 func (t *ticker) tick() <-chan time.Time {
@@ -117,7 +119,7 @@ type Raft struct {
 	// state a Raft server must maintain.
 	currentTerm int
 	votedFor    int
-	log         raftLog
+	log         *raftLog
 
 	commitIndex int
 	lastApplied int
@@ -150,11 +152,9 @@ type Raft struct {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
-	// Your code here (3A).
-	return term, isleader
+	rf.mu.RLock()
+	defer rf.mu.RUnlock()
+	return rf.currentTerm, rf.state == isLeader
 }
 
 // save Raft's persistent state to stable storage,
@@ -333,6 +333,7 @@ type SendLogArgs struct {
 
 type SendLogReply struct {
 	Term    int
+	Index   int
 	Success bool
 	NodeID  int
 }
@@ -447,40 +448,38 @@ func (rf *Raft) run() {
 		case msg := <-rf.followerResp:
 			switch m := msg.payload.(type) {
 			case RequestVoteReply:
-				if rf.state == isCandidate {
-					rf.mu.Lock()
-					if m.Term == rf.currentTerm {
-						if m.VoteGranted {
-							rf.getVoteCount++
-							if rf.getVoteCount > len(rf.peers)/2 {
-								rf.logPrintf().Info("成为领导者节点")
-								rf.state = isLeader
-								rf.sendToFollowers <- changeState{
-									from: isCandidate,
-									to:   isLeader,
-									term: rf.currentTerm,
-								}
-								rf.ticker.newOutTime(heartBeatTick)
-								// TODO 生成空log
+				rf.mu.Lock()
+				if rf.state == isCandidate && m.Term == rf.currentTerm {
+					if m.VoteGranted {
+						rf.getVoteCount++
+						if rf.getVoteCount > len(rf.peers)/2 {
+							rf.logPrintf().Info("成为领导者节点")
+							rf.state = isLeader
+							rf.sendToFollowers <- changeState{
+								from: isCandidate,
+								to:   isLeader,
+								term: rf.currentTerm,
 							}
-						} else {
-							if m.Term > rf.currentTerm {
-								rf.currentTerm = m.Term
-								rf.votedFor = -1 // 任期变了，选票需要重置
-								rf.getVoteCount = 0
-								rf.state = isFollower
-								rf.sendToFollowers <- changeState{
-									from: isCandidate,
-									to:   isFollower,
-									term: rf.currentTerm,
-								}
-								rf.persist() // 状态改变，必须持久化
-								rf.ticker.newOutTime(electionTick)
+							rf.ticker.newOutTime(heartBeatTick)
+							// TODO 生成空log
+						}
+					} else {
+						if m.Term > rf.currentTerm {
+							rf.currentTerm = m.Term
+							rf.votedFor = -1 // 任期变了，选票需要重置
+							rf.getVoteCount = 0
+							rf.state = isFollower
+							rf.sendToFollowers <- changeState{
+								from: isCandidate,
+								to:   isFollower,
+								term: rf.currentTerm,
 							}
+							rf.persist() // 状态改变，必须持久化
+							rf.ticker.newOutTime(electionTick)
 						}
 					}
-					rf.mu.Unlock()
 				}
+				rf.mu.Unlock()
 			}
 		case <-rf.ctx.Done():
 			return
@@ -520,7 +519,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	}
 	rf.logPrintf().Info("raft core启动")
 	rf.ctx, rf.ctxCancel = context.WithCancel(context.Background())
-	rf.log = newRaftLog(rf.logger)
+	rf.log = newRaftLog(rf.ctx, len(peers), applyCh, rf.logger)
 
 	sub := make([]chan any, len(peers))
 	sendToFollowers := make(chan any)
