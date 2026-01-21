@@ -15,10 +15,9 @@ type resp struct {
 
 type newLog struct{}
 
-type follower struct {
+type peer struct {
 	mu         sync.Mutex
 	me         int
-	term       int
 	nextIndex  int
 	matchIndex int
 	followerId int
@@ -40,9 +39,6 @@ type follower struct {
 	// 存储发送数据rpc接口，注意参数需要是指针类型
 	call func(svcMeth string, args any, reply any) bool
 
-	// 确认自身raft核心目前的身份
-	status StateType
-
 	getCoreStatus func() coreStatus
 
 	// 存储等待发送的非日志请求（心跳、拉票）
@@ -57,6 +53,9 @@ type follower struct {
 	// 一个内部chan，用来唤醒send
 	wakeup chan struct{}
 
+	getCurrentTerm func() int64
+	getState       func() int64
+
 	logger        *zap.Logger
 	rootCtx       context.Context
 	rootCtxCancel context.CancelFunc
@@ -64,22 +63,22 @@ type follower struct {
 	subCtxCancel  context.CancelFunc
 }
 
-// 返回一个chan用来接受follower的reply
-func NewFollower(
+func newPeer(
 	ctx context.Context,
 	me, term, nextIndex, matchIndex, followerId int,
 	getCoreLog func(i int) (Entry, error),
 	getCoreLastIndex func() int,
 	call func(svcMeth string, args any, reply any) bool,
 	getCoreStatus func() coreStatus,
+	getCurrentTerm func() int64,
+	getState func() int64,
 	input <-chan any,
 	output chan<- resp,
 	logger *zap.Logger,
 ) {
-	f := follower{
+	f := peer{
 		mu:               sync.Mutex{},
 		me:               me,
-		term:             term,
 		nextIndex:        nextIndex,
 		matchIndex:       matchIndex,
 		followerId:       followerId,
@@ -88,6 +87,8 @@ func NewFollower(
 		call:             call,
 		getCoreStatus:    getCoreStatus,
 		wakeup:           make(chan struct{}, 1),
+		getCurrentTerm:   getCurrentTerm,
+		getState:         getState,
 		input:            input,
 		output:           output,
 		logger:           logger,
@@ -100,7 +101,7 @@ func NewFollower(
 }
 
 // 将rpc包装为一个chan，true为发送成功，false为发送失败
-func (f *follower) rpcChan(svcMeth string, args any, reply any) <-chan bool {
+func (f *peer) rpcChan(svcMeth string, args any, reply any) <-chan bool {
 	// 保留一个缓存以防止goroutine泄露
 	retChan := make(chan bool, 1)
 	go func() {
@@ -119,35 +120,36 @@ func (f *follower) rpcChan(svcMeth string, args any, reply any) <-chan bool {
 	return retChan
 }
 
-func (f *follower) send() {
+func (f *peer) send() {
 	for range f.wakeup {
 		for f.maybeSendAppend() {
 		}
 	}
 }
 
-func (f *follower) findConflict(arg SendLogArgs, reply SendLogReply) {
+func (f *peer) findConflict(arg SendLogArgs, reply SendLogReply) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	// 首先确定是否需要处理冲突，如果任期不一致，将情况交给core判断
-	if reply.Term == f.term {
+	if reply.Term == int(f.getCurrentTerm()) {
 		// TODO 需要实现快速回退逻辑
 		f.nextIndex = arg.PrevLogIndex - 1
 	}
 }
 
 // 尝试排空待发送队列，返回 true 表明成功取得数据并发送，返回 false 表示队列为空
-func (f *follower) maybeSendAppend() bool {
+func (f *peer) maybeSendAppend() bool {
 	var msg any
 	f.mu.Lock()
-	if f.status == isFollower {
+	if StateType(f.getState()) == isFollower {
 		f.mu.Unlock()
 		return false
 	}
 	switch {
 	// 存在特殊信息需要发送
 	case len(f.pendingLog) != 0:
+		f.logger.Debug("发送心跳或者拉票请求")
 		msg = f.pendingLog[0]
 		f.pendingLog = f.pendingLog[1:]
 
@@ -157,6 +159,7 @@ func (f *follower) maybeSendAppend() bool {
 		}
 	// 存在需要同步的日志
 	case f.getCoreLastIndex() >= f.nextIndex:
+		f.logger.Debug("发送日志", zap.Int("index", f.nextIndex))
 		prevEntity, err := f.getCoreLog(f.nextIndex - 1)
 		if err != nil {
 			f.logger.Error("无法获取日志", zap.Error(err))
@@ -170,7 +173,7 @@ func (f *follower) maybeSendAppend() bool {
 			return false
 		}
 		msg = SendLogArgs{
-			Term:         f.term,
+			Term:         int(f.getCurrentTerm()),
 			LeaderID:     f.me,
 			PrevLogIndex: prevEntity.Index,
 			PrevLogTerm:  prevEntity.Term,
@@ -179,7 +182,7 @@ func (f *follower) maybeSendAppend() bool {
 		}
 		f.sentCommit = uint64(entity.Index)
 	default:
-		f.logger.Info("follower的发送函数被唤醒，但没有消息可发")
+		f.logger.Debug("follower的发送函数被唤醒，但没有消息可发")
 		f.mu.Unlock()
 		return false
 	}
@@ -238,16 +241,17 @@ func (f *follower) maybeSendAppend() bool {
 	return false
 }
 
-func (f *follower) close(ctx context.Context) {
+func (f *peer) close(ctx context.Context) {
 	<-ctx.Done()
 	close(f.wakeup)
 	close(f.output)
 }
 
-func (f *follower) sendMsg() {
+func (f *peer) sendMsg() {
 	for msg := range f.input {
 		switch m := msg.(type) {
 		case RequestVoteArgs, HeartBeatArgs:
+			f.logger.Debug("follower接收到投票或心跳")
 			f.mu.Lock()
 			f.pendingLog = append(f.pendingLog, m)
 			f.mu.Unlock()
@@ -257,35 +261,35 @@ func (f *follower) sendMsg() {
 			default:
 			}
 		case changeState:
-			if m.term < f.term {
+			if m.term < int(f.getCurrentTerm()) {
 				continue
 			}
 			f.mu.Lock()
+			f.logger.Debug("follower接收到节点状态改变", zap.Int("followTerm", int(f.getCurrentTerm())), zap.Int("msgTerm", m.term))
 			f.subCtxCancel()
 			f.subCtx, f.subCtxCancel = context.WithCancel(f.rootCtx)
 			switch m.to {
 			case isLeader:
-				f.status = isLeader
-				f.term = m.term
 				f.nextIndex = f.getCoreLastIndex() + 1
 				f.matchIndex = 0
 			case isCandidate:
-				f.status = isCandidate
-				f.term = m.term
 				f.pendingLog = make([]any, 0, 10)
 			case isFollower:
-				f.status = isFollower
-				f.term = m.term
 				f.pendingLog = make([]any, 0, 10)
+			default:
+				f.logger.Panic("未知类型")
 			}
 			f.mu.Unlock()
 		case newLog:
 			// 普通log
+			f.logger.Debug("follower接收到新的log")
 			select {
 			case f.wakeup <- struct{}{}:
 			case <-f.rootCtx.Done():
 			default:
 			}
+		case struct{}:
+			// 探测信号
 		default:
 			f.logger.Panic("一个未知的类型")
 		}
