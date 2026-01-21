@@ -257,6 +257,9 @@ func (f *follower) sendMsg() {
 			default:
 			}
 		case changeState:
+			if m.term < f.term {
+				continue
+			}
 			f.mu.Lock()
 			f.subCtxCancel()
 			f.subCtx, f.subCtxCancel = context.WithCancel(f.rootCtx)

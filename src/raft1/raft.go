@@ -64,7 +64,7 @@ func (rf *Raft) logPrintf() *zap.Logger {
 		zap.String("State", stateStr),
 		zap.Int("LIDx", rf.log.endIndex()),
 		zap.Int("LTerm", rf.log.endTerm()),
-		zap.Int("Commit", rf.commitIndex),
+		zap.Int("Commit", rf.log.getCommitIndex()),
 		zap.Int("Loffset", rf.log.offset),
 	)
 }
@@ -121,7 +121,6 @@ type Raft struct {
 	votedFor    int
 	log         *raftLog
 
-	commitIndex int
 	lastApplied int
 
 	// 用来统计选票，每次term更新记得归零
@@ -143,10 +142,14 @@ type Raft struct {
 	// 用于接受所有follower的返回信号
 	followerResp <-chan resp
 
-	// 用来处理自身的信号
-	selfChan chan any
-
 	ticker ticker
+}
+
+// raft 内部函数，调用时必须持有写锁
+func (rf *Raft) updateTerm(term int) {
+	rf.currentTerm = term
+	rf.votedFor = -1 // 任期变了，选票需要重置
+	rf.getVoteCount = 0
 }
 
 // return currentTerm and whether this server
@@ -212,7 +215,7 @@ func (rf *Raft) getRaftCoreStatus() coreStatus {
 	cs := coreStatus{
 		currentTerm: rf.currentTerm,
 		votedFor:    rf.votedFor,
-		commitIndex: rf.commitIndex,
+		commitIndex: rf.log.getCommitIndex(),
 		lastApplied: rf.lastApplied,
 		state:       rf.state,
 		me:          rf.me,
@@ -261,7 +264,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	var cs *changeState //如果投票请求导致节点状态变化，需要通知follower管理器
 	defer func() {
 		if cs != nil {
-			rf.selfChan <- cs
+			rf.sendToFollowers <- cs
 		}
 	}()
 	// 默认回复
@@ -276,9 +279,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// 注意：即使 args.Term > currentTerm，我们也不一定投票给它（还需要检查日志）
 	// 但我们需要更新自己的任期状态
 	if args.Term > rf.currentTerm {
-		rf.currentTerm = args.Term
-		rf.votedFor = -1 // 任期变了，选票需要重置
-		rf.getVoteCount = 0
+		rf.updateTerm(args.Term)
 		if rf.state != isFollower {
 			cs = &changeState{
 				from: rf.state,
@@ -346,7 +347,65 @@ type HeartBeatReply struct {
 }
 
 func (rf *Raft) ReceiveLog(args *SendLogArgs, reply *SendLogReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
+	var cs *changeState
+	defer func() {
+		if cs != nil {
+			rf.sendToFollowers <- *cs
+		}
+	}()
+	reply.NodeID = rf.me
+
+	if args.Term < rf.currentTerm {
+		reply.Success = false
+		reply.Term = rf.currentTerm
+		return
+	}
+
+	rf.ticker.newOutTime(electionTick) // 无论如何，只要term有效就重置记时器
+
+	if args.Term > rf.currentTerm {
+		rf.updateTerm(args.Term)
+		if rf.state != isFollower {
+			cs = &changeState{
+				from: rf.state,
+				to:   isFollower,
+				term: rf.currentTerm,
+			}
+			rf.state = isFollower
+		}
+		rf.persist() // 状态改变，必须持久化
+	}
+
+	reply.Term = rf.currentTerm
+
+	prevLog, err := rf.log.get(args.PrevLogIndex)
+	if err != nil {
+		rf.logPrintf().Warn("无法获取prevLog", zap.Int("prevLogIndex", args.PrevLogIndex), zap.Error(err))
+		reply.Success = false
+		return
+	}
+	if prevLog.Index == args.PrevLogIndex && prevLog.Term == args.PrevLogTerm {
+		rf.log.append(args.Entries)
+		reply.Index = args.Entries.Index
+		reply.Success = true
+		rf.log.setCommit(args.LeaderCommit)
+		rf.persist()
+		rf.logPrintf().Debug("确认新的日志", zap.Int("index", args.Entries.Index))
+		return
+	}
+
+	reply.Success = false
+	rf.logPrintf().Debug(
+		"由于prevLog不匹配，拒绝新的日志",
+		zap.Int("index", args.Entries.Index),
+		zap.Int("prevLogIndex", prevLog.Index),
+		zap.Int("prevLogTerm", prevLog.Term),
+		zap.Int("argsPrevLogIndex", args.PrevLogIndex),
+		zap.Int("argsPrevLogTerm", args.PrevLogTerm),
+	)
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -381,7 +440,7 @@ func (rf *Raft) tickOutTime() {
 				LeaderID:     rf.me,
 				PrevLogIndex: rf.log.endIndex(),
 				PrevLogTerm:  rf.log.endTerm(),
-				LeaderCommit: rf.commitIndex,
+				LeaderCommit: rf.log.getCommitIndex(),
 				Entries:      Entry{},
 			},
 		}
@@ -466,9 +525,7 @@ func (rf *Raft) processVoteReply(m RequestVoteReply) {
 			}
 		} else {
 			if m.Term > rf.currentTerm {
-				rf.currentTerm = m.Term
-				rf.votedFor = -1 // 任期变了，选票需要重置
-				rf.getVoteCount = 0
+				rf.updateTerm(m.Term)
 				rf.state = isFollower
 				rf.sendToFollowers <- changeState{
 					from: isCandidate,
@@ -483,24 +540,43 @@ func (rf *Raft) processVoteReply(m RequestVoteReply) {
 	rf.mu.Unlock()
 }
 
+func (rf *Raft) processReply(m SendLogReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if m.Term < rf.currentTerm {
+		return
+	}
+	if m.Term > rf.currentTerm {
+		rf.updateTerm(m.Term)
+		rf.sendToFollowers <- changeState{
+			from: rf.state,
+			to:   isFollower,
+			term: rf.currentTerm,
+		}
+		rf.state = isFollower
+		rf.persist() // 状态改变，必须持久化
+		rf.ticker.newOutTime(electionTick)
+		return
+	}
+
+	rf.log.logAccept(m)
+	rf.persist()
+}
+
 func (rf *Raft) run() {
 	for {
 		select {
 		case <-rf.ticker.tick():
 			rf.tickOutTime()
-		case msg := <-rf.selfChan:
-			switch m := msg.(type) {
-			case changeState:
-				if (m.from == isCandidate && m.to == isCandidate) || (m.from != m.to) {
-					rf.sendToFollowers <- m
-				}
-			}
 		case msg := <-rf.followerResp:
 			switch m := msg.payload.(type) {
 			case RequestVoteReply:
 				rf.processVoteReply(m)
 			case SendLogReply:
-				// TODO
+				rf.processReply(m)
+			case HeartBeatArgs:
+
 			}
 		case <-rf.ctx.Done():
 			return
@@ -528,7 +604,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		currentTerm: 0,
 		votedFor:    -1,
 
-		commitIndex: 0,
 		lastApplied: 0,
 
 		state: isFollower,

@@ -162,6 +162,7 @@ func (rl *raftLog) append(ents ...Entry) {
 
 // 需要保证传入的 resp 是本任期的响应，以实现间接提交。函数内部不再检查term
 func (rl *raftLog) logAccept(resp SendLogReply) {
+	// TODO 也许可以实现一个logRespCount缩容操作
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 	if resp.Index > int(rl.committed) {
@@ -173,6 +174,19 @@ func (rl *raftLog) logAccept(resp SendLogReply) {
 			case rl.selfCh <- struct{}{}:
 			default:
 			}
+		}
+	}
+}
+
+func (rl *raftLog) setCommit(commit int) {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	if rl.committed < commit {
+		rl.committed = commit
+		rl.logger.Info("提交log数据", zap.Int("commitIndex", commit))
+		select {
+		case rl.selfCh <- struct{}{}:
+		default:
 		}
 	}
 }
