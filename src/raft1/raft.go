@@ -687,7 +687,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.sendToFollowers = sendToFollowers
 	rf.followerResp = followerResp
 
-	go broadcast(rf.ctx, sendToFollowers, sub)
+	go broadcast(rf.ctx, sendToFollowers, sub, me)
 	// Your initialization code here (3A, 3B, 3C).
 
 	// initialize from state persisted before a crash
@@ -724,7 +724,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	return rf
 }
 
-func broadcast(ctx context.Context, put <-chan any, sub []chan any) {
+func broadcast(ctx context.Context, put <-chan any, sub []chan any, me int) {
 	defer func() {
 		for i := range sub {
 			close(sub[i])
@@ -737,6 +737,9 @@ func broadcast(ctx context.Context, put <-chan any, sub []chan any) {
 		case msg := <-put:
 			// sub中的接受chan是无阻塞的
 			for i := range sub {
+				if i == me {
+					continue
+				}
 				sub[i] <- msg
 			}
 		}
@@ -744,13 +747,13 @@ func broadcast(ctx context.Context, put <-chan any, sub []chan any) {
 }
 
 func (rf *Raft) debug() {
-	tick := time.NewTicker(10 * time.Second)
-	for {
-		<-tick.C
-		select {
-		case rf.sendToFollowers <- struct{}{}:
-		case <-time.After(1000 * time.Millisecond):
-			rf.logger.Warn("follower阻塞")
-		}
-	}
+	//tick := time.NewTicker(10 * time.Second)
+	//for {
+	//	<-tick.C
+	//	select {
+	//	case rf.sendToFollowers <- struct{}{}:
+	//	case <-time.After(1000 * time.Millisecond):
+	//		rf.logger.Warn("follower阻塞")
+	//	}
+	//}
 }

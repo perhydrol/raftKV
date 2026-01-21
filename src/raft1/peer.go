@@ -2,6 +2,7 @@ package raft
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -9,8 +10,8 @@ import (
 )
 
 type resp struct {
-	followerId int
-	payload    any
+	peerId  int
+	payload any
 }
 
 type newLog struct{}
@@ -20,7 +21,7 @@ type peer struct {
 	me         int
 	nextIndex  int
 	matchIndex int
-	followerId int
+	peerId     int
 
 	// sentCommit 是当前向跟随者发送的最高提交索引。
 	sentCommit uint64
@@ -65,7 +66,7 @@ type peer struct {
 
 func newPeer(
 	ctx context.Context,
-	me, term, nextIndex, matchIndex, followerId int,
+	me, term, nextIndex, matchIndex, peerId int,
 	getCoreLog func(i int) (Entry, error),
 	getCoreLastIndex func() int,
 	call func(svcMeth string, args any, reply any) bool,
@@ -81,7 +82,7 @@ func newPeer(
 		me:               me,
 		nextIndex:        nextIndex,
 		matchIndex:       matchIndex,
-		followerId:       followerId,
+		peerId:           peerId,
 		getCoreLog:       getCoreLog,
 		getCoreLastIndex: getCoreLastIndex,
 		call:             call,
@@ -91,10 +92,10 @@ func newPeer(
 		getState:         getState,
 		input:            input,
 		output:           output,
-		logger:           logger,
 		ctx:              ctx,
 	}
 	f.subCtx, f.subCtxCancel = context.WithCancel(ctx)
+	f.logger = logger.With(zap.Int("peerID", peerId))
 	go f.sendMsg()
 	go f.send()
 	go f.close(ctx)
@@ -182,7 +183,7 @@ func (f *peer) maybeSendAppend() bool {
 		}
 		f.sentCommit = uint64(entity.Index)
 	default:
-		f.logger.Debug("follower的发送函数被唤醒，但没有消息可发")
+		f.logger.Debug("peer的发送函数被唤醒，但没有消息可发")
 		f.mu.Unlock()
 		return false
 	}
@@ -198,8 +199,8 @@ func (f *peer) maybeSendAppend() bool {
 			return false
 		}
 		r := resp{
-			followerId: f.followerId,
-			payload:    reply,
+			peerId:  f.peerId,
+			payload: reply,
 		}
 		select {
 		case f.output <- r:
@@ -248,11 +249,12 @@ func (f *peer) close(ctx context.Context) {
 }
 
 func (f *peer) sendMsg() {
-	defer f.logger.Warn("peer事件循环退出", zap.Int("peerId", f.followerId))
+	states := [...]string{"FOLLOWER", "CANDIDATE", "LEADER"}
+	defer f.logger.Warn("peer事件循环退出", zap.Int("peerId", f.peerId))
 	for msg := range f.input {
 		switch m := msg.(type) {
 		case RequestVoteArgs, HeartBeatArgs:
-			f.logger.Debug("follower接收到投票或心跳")
+			f.logger.Debug("peer接收到投票或心跳")
 			f.mu.Lock()
 			f.pendingLog = append(f.pendingLog, m)
 			f.mu.Unlock()
@@ -266,7 +268,13 @@ func (f *peer) sendMsg() {
 				continue
 			}
 			f.mu.Lock()
-			f.logger.Debug("follower接收到节点状态改变", zap.Int("followTerm", int(f.getCurrentTerm())), zap.Int("msgTerm", m.term))
+			f.logger.Debug(
+				"peer接收到节点状态改变",
+				zap.Int("followTerm", int(f.getCurrentTerm())),
+				zap.Int("msgTerm", m.term),
+				zap.String("from", states[m.from]),
+				zap.String("to", states[m.to]),
+			)
 			f.subCtxCancel()
 			f.subCtx, f.subCtxCancel = context.WithCancel(f.ctx)
 			switch m.to {
@@ -283,7 +291,7 @@ func (f *peer) sendMsg() {
 			f.mu.Unlock()
 		case newLog:
 			// 普通log
-			f.logger.Debug("follower接收到新的log")
+			f.logger.Debug("peer接收到新的log")
 			select {
 			case f.wakeup <- struct{}{}:
 			case <-f.ctx.Done():
@@ -292,7 +300,7 @@ func (f *peer) sendMsg() {
 		case struct{}:
 			// 探测信号
 		default:
-			f.logger.Panic("一个未知的类型")
+			f.logger.Panic("一个未知的类型", zap.Any("value", m), zap.String("type", fmt.Sprintf("%T", m)))
 		}
 	}
 }
