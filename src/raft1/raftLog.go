@@ -114,15 +114,13 @@ func (rl *raftLog) getSlice(begin, end int) ([]Entry, error) {
 		end = rl.offset + len(rl.logData) - 1
 	}
 
-	// 如果范围无效，返回空切片
 	if begin > end {
-		return []Entry{}, nil
+		return []Entry{}, fmt.Errorf("日志范围错误（begin应该小于等于end）")
 	}
 
 	startIdx := begin - rl.offset
 	endIdx := end - rl.offset
 
-	// 双重检查索引范围
 	if startIdx < 0 || endIdx >= len(rl.logData) || startIdx > endIdx {
 		return []Entry{}, nil
 	}
@@ -133,7 +131,7 @@ func (rl *raftLog) getSlice(begin, end int) ([]Entry, error) {
 	return result, nil
 }
 
-func (rl *raftLog) newLog(command *interface{}, term int) Entry {
+func (rl *raftLog) newLog(command *any, term int) Entry {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 	e := Entry{

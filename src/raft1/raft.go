@@ -433,6 +433,56 @@ func (rf *Raft) election() {
 	rf.sendToFollowers <- requestVote
 }
 
+func (rf *Raft) processVoteReply(m RequestVoteReply) {
+	rf.mu.Lock()
+	if rf.state == isCandidate && m.Term == rf.currentTerm {
+		if m.VoteGranted {
+			rf.getVoteCount++
+			if rf.getVoteCount > len(rf.peers)/2 {
+				rf.logPrintf().Info("成为领导者节点")
+				rf.state = isLeader
+				rf.sendToFollowers <- changeState{
+					from: isCandidate,
+					to:   isLeader,
+					term: rf.currentTerm,
+				}
+				rf.ticker.newOutTime(heartBeatTick)
+				entity := rf.log.newLog(nil, rf.currentTerm)
+				prevLogIndex := entity.Index - 1
+				prevLogTerm, err := rf.log.getTerm(entity.Index - 1)
+				if err != nil {
+					rf.logPrintf().Error("获取term错误", zap.Int("index", prevLogIndex), zap.Error(err))
+					panic(err)
+				}
+				msg := SendLogArgs{
+					Term:         rf.currentTerm,
+					LeaderID:     rf.me,
+					PrevLogIndex: prevLogIndex,
+					PrevLogTerm:  prevLogTerm,
+					LeaderCommit: rf.log.getCommitIndex(),
+					Entries:      entity,
+				}
+				rf.sendToFollowers <- msg
+			}
+		} else {
+			if m.Term > rf.currentTerm {
+				rf.currentTerm = m.Term
+				rf.votedFor = -1 // 任期变了，选票需要重置
+				rf.getVoteCount = 0
+				rf.state = isFollower
+				rf.sendToFollowers <- changeState{
+					from: isCandidate,
+					to:   isFollower,
+					term: rf.currentTerm,
+				}
+				rf.persist() // 状态改变，必须持久化
+				rf.ticker.newOutTime(electionTick)
+			}
+		}
+	}
+	rf.mu.Unlock()
+}
+
 func (rf *Raft) run() {
 	for {
 		select {
@@ -448,38 +498,9 @@ func (rf *Raft) run() {
 		case msg := <-rf.followerResp:
 			switch m := msg.payload.(type) {
 			case RequestVoteReply:
-				rf.mu.Lock()
-				if rf.state == isCandidate && m.Term == rf.currentTerm {
-					if m.VoteGranted {
-						rf.getVoteCount++
-						if rf.getVoteCount > len(rf.peers)/2 {
-							rf.logPrintf().Info("成为领导者节点")
-							rf.state = isLeader
-							rf.sendToFollowers <- changeState{
-								from: isCandidate,
-								to:   isLeader,
-								term: rf.currentTerm,
-							}
-							rf.ticker.newOutTime(heartBeatTick)
-							// TODO 生成空log
-						}
-					} else {
-						if m.Term > rf.currentTerm {
-							rf.currentTerm = m.Term
-							rf.votedFor = -1 // 任期变了，选票需要重置
-							rf.getVoteCount = 0
-							rf.state = isFollower
-							rf.sendToFollowers <- changeState{
-								from: isCandidate,
-								to:   isFollower,
-								term: rf.currentTerm,
-							}
-							rf.persist() // 状态改变，必须持久化
-							rf.ticker.newOutTime(electionTick)
-						}
-					}
-				}
-				rf.mu.Unlock()
+				rf.processVoteReply(m)
+			case SendLogReply:
+				// TODO
 			}
 		case <-rf.ctx.Done():
 			return
