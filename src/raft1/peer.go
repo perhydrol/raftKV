@@ -56,11 +56,11 @@ type peer struct {
 	getCurrentTerm func() int64
 	getState       func() int64
 
-	logger        *zap.Logger
-	rootCtx       context.Context
-	rootCtxCancel context.CancelFunc
-	subCtx        context.Context
-	subCtxCancel  context.CancelFunc
+	logger       *zap.Logger
+	subCtx       context.Context
+	subCtxCancel context.CancelFunc
+
+	ctx context.Context
 }
 
 func newPeer(
@@ -92,9 +92,9 @@ func newPeer(
 		input:            input,
 		output:           output,
 		logger:           logger,
+		ctx:              ctx,
 	}
-	f.rootCtx, f.rootCtxCancel = context.WithCancel(ctx)
-	f.subCtx, f.subCtxCancel = context.WithCancel(f.rootCtx)
+	f.subCtx, f.subCtxCancel = context.WithCancel(ctx)
 	go f.sendMsg()
 	go f.send()
 	go f.close(ctx)
@@ -248,6 +248,7 @@ func (f *peer) close(ctx context.Context) {
 }
 
 func (f *peer) sendMsg() {
+	defer f.logger.Warn("peer事件循环退出", zap.Int("peerId", f.followerId))
 	for msg := range f.input {
 		switch m := msg.(type) {
 		case RequestVoteArgs, HeartBeatArgs:
@@ -257,7 +258,7 @@ func (f *peer) sendMsg() {
 			f.mu.Unlock()
 			select {
 			case f.wakeup <- struct{}{}:
-			case <-f.rootCtx.Done():
+			case <-f.ctx.Done():
 			default:
 			}
 		case changeState:
@@ -267,7 +268,7 @@ func (f *peer) sendMsg() {
 			f.mu.Lock()
 			f.logger.Debug("follower接收到节点状态改变", zap.Int("followTerm", int(f.getCurrentTerm())), zap.Int("msgTerm", m.term))
 			f.subCtxCancel()
-			f.subCtx, f.subCtxCancel = context.WithCancel(f.rootCtx)
+			f.subCtx, f.subCtxCancel = context.WithCancel(f.ctx)
 			switch m.to {
 			case isLeader:
 				f.nextIndex = f.getCoreLastIndex() + 1
@@ -285,7 +286,7 @@ func (f *peer) sendMsg() {
 			f.logger.Debug("follower接收到新的log")
 			select {
 			case f.wakeup <- struct{}{}:
-			case <-f.rootCtx.Done():
+			case <-f.ctx.Done():
 			default:
 			}
 		case struct{}:
