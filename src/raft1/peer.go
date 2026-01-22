@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -60,6 +61,7 @@ type peer struct {
 	logger       *zap.Logger
 	subCtx       context.Context
 	subCtxCancel context.CancelFunc
+	subCtxDone   atomic.Value
 
 	ctx context.Context
 }
@@ -95,6 +97,7 @@ func newPeer(
 		ctx:              ctx,
 	}
 	f.subCtx, f.subCtxCancel = context.WithCancel(ctx)
+	f.subCtxDone.Store(f.subCtx.Done())
 	f.logger = logger.With(zap.Int("peerID", peerId))
 	go f.sendMsg()
 	go f.send()
@@ -160,8 +163,8 @@ func (f *peer) maybeSendAppend() bool {
 		}
 	// 存在需要同步的日志
 	case f.getCoreLastIndex() >= f.nextIndex:
-		f.logger.Debug("发送日志", zap.Int("index", f.nextIndex))
 		prevEntity, err := f.getCoreLog(f.nextIndex - 1)
+		f.logger.Debug("发送日志", zap.Int("index", f.nextIndex), zap.Int("prevIndex", prevEntity.Index))
 		if err != nil {
 			f.logger.Error("无法获取日志", zap.Error(err))
 			f.mu.Unlock()
@@ -213,7 +216,8 @@ func (f *peer) maybeSendAppend() bool {
 	switch m := msg.(type) {
 	case SendLogArgs:
 		reply := SendLogReply{}
-		ok := wrapCall("Raft.ReceiveLog", &m, &reply, f.subCtx.Done())
+		ch := f.subCtxDone.Load().(<-chan struct{})
+		ok := wrapCall("Raft.ReceiveLog", &m, &reply, ch)
 		if ok {
 			if reply.Success {
 				f.mu.Lock()
@@ -228,11 +232,13 @@ func (f *peer) maybeSendAppend() bool {
 		return true
 	case RequestVoteArgs:
 		reply := RequestVoteReply{}
-		ok := wrapCall("Raft.RequestVote", &m, &reply, f.subCtx.Done())
+		ch := f.subCtxDone.Load().(<-chan struct{})
+		ok := wrapCall("Raft.RequestVote", &m, &reply, ch)
 		return ok
 	case HeartBeatArgs:
 		reply := HeartBeatReply{}
-		ok := wrapCall("Raft.ReceiveHeartBeat", &m, &reply, f.subCtx.Done())
+		ch := f.subCtxDone.Load().(<-chan struct{})
+		ok := wrapCall("Raft.ReceiveHeartBeat", &m, &reply, ch)
 		if ok && !reply.Success {
 			f.findConflict(m.SendLogArgs, reply.SendLogReply)
 		}
@@ -245,7 +251,7 @@ func (f *peer) close(ctx context.Context) {
 	<-ctx.Done()
 	close(f.wakeup)
 	f.subCtxCancel()
-	close(f.output)
+	// close(f.output)
 }
 
 func (f *peer) sendMsg() {
@@ -277,6 +283,7 @@ func (f *peer) sendMsg() {
 			)
 			f.subCtxCancel()
 			f.subCtx, f.subCtxCancel = context.WithCancel(f.ctx)
+			f.subCtxDone.Store(f.subCtx.Done())
 			switch m.to {
 			case isLeader:
 				f.nextIndex = f.getCoreLastIndex() + 1
