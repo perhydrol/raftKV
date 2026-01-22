@@ -249,9 +249,11 @@ func (f *peer) maybeSendAppend() bool {
 
 func (f *peer) close(ctx context.Context) {
 	<-ctx.Done()
+	f.mu.Lock()
 	close(f.wakeup)
 	f.subCtxCancel()
 	// close(f.output)
+	f.mu.Unlock()
 }
 
 func (f *peer) sendMsg() {

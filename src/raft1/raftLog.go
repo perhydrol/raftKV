@@ -246,14 +246,16 @@ func (rl *raftLog) apply() {
 				continue
 			}
 			e, err := rl.getSlice(rl.applied+1, rl.committed)
-			commited := rl.committed
-			rl.mu.RUnlock()
-
 			if err != nil {
 				rl.logger.Panic("获取log失败", zap.Int("beginIndex", rl.applied+1), zap.Int("endIndex", rl.committed), zap.Error(err))
 			}
+			commited := rl.committed
+			rl.mu.RUnlock()
 
 			for i := range e {
+				if e[i].Command == nil {
+					continue
+				}
 				select {
 				case <-rl.ctx.Done():
 					return

@@ -302,7 +302,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	var cs *changeState //如果投票请求导致节点状态变化，需要通知follower管理器
 	defer func() {
 		if cs != nil {
-			rf.sendToFollowers <- cs
+			rf.sendToFollowers <- *cs
 		}
 	}()
 	// 默认回复
