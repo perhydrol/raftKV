@@ -46,7 +46,7 @@ func newRaftLog(ctx context.Context, peerLen int, applyCh chan raftapi.ApplyMsg,
 	rl := raftLog{
 		mu:           sync.RWMutex{},
 		logData:      []Entry{},
-		offset:       1,
+		offset:       0,
 		committed:    0,
 		applied:      0,
 		logRespCount: map[int]int{},
@@ -59,6 +59,15 @@ func newRaftLog(ctx context.Context, peerLen int, applyCh chan raftapi.ApplyMsg,
 	go rl.apply()
 	go rl.close()
 
+	if len(rl.logData) == 0 {
+		// 哨兵节点
+		e := Entry{
+			Command: nil,
+			Term:    0,
+			Index:   0,
+		}
+		rl.logData = append(rl.logData, e)
+	}
 	// 如果从崩溃中恢复，则继续处理log
 	rl.selfCh <- struct{}{}
 	return &rl
@@ -73,10 +82,11 @@ func (rl *raftLog) close() {
 func (rl *raftLog) getIndex(i int) (int, error) {
 	rl.mu.RLock()
 	defer rl.mu.RUnlock()
-	entry, err := rl.get(i)
-	if err != nil {
-		return -1, err
+	index := i - rl.offset
+	if index < 0 || index >= len(rl.logData) {
+		return -1, fmt.Errorf("目标日志不存在: %d", i)
 	}
+	entry := rl.logData[index]
 	return entry.Index, nil
 }
 
@@ -94,10 +104,11 @@ func (rl *raftLog) getTerm(i int) (int, error) {
 	}()
 	rl.mu.RLock()
 	defer rl.mu.RUnlock()
-	entry, err := rl.get(i)
-	if err != nil {
-		return -1, err
+	index := i - rl.offset
+	if index < 0 || index >= len(rl.logData) {
+		return -1, fmt.Errorf("目标日志不存在: %d", i)
 	}
+	entry := rl.logData[index]
 	return entry.Term, nil
 }
 
@@ -122,10 +133,6 @@ func (rl *raftLog) getSlice(begin, end int) ([]Entry, error) {
 	defer func() {
 		rl.logger.Debug("退出getSlice")
 	}()
-	if len(rl.logData) == 0 {
-		return []Entry{}, nil
-	}
-
 	if begin < rl.offset {
 		begin = rl.offset
 	}
@@ -160,7 +167,7 @@ func (rl *raftLog) newLog(command *any, term int) Entry {
 	e := Entry{
 		Command: command,
 		Term:    term,
-		Index:   rl.endIndex() + 1,
+		Index:   rl.logData[len(rl.logData)-1].Index + 1,
 	}
 	rl.logData = append(rl.logData, e)
 	return e
@@ -288,9 +295,6 @@ func (rl *raftLog) endIndex() int {
 	}()
 	rl.mu.RLock()
 	defer rl.mu.RUnlock()
-	if len(rl.logData) == 0 {
-		return 0
-	}
 	return rl.logData[len(rl.logData)-1].Index
 }
 
@@ -301,8 +305,5 @@ func (rl *raftLog) endTerm() int {
 	}()
 	rl.mu.RLock()
 	defer rl.mu.RUnlock()
-	if len(rl.logData) == 0 {
-		return 0
-	}
 	return rl.logData[len(rl.logData)-1].Term
 }

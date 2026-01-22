@@ -189,13 +189,13 @@ func (f *peer) maybeSendAppend() bool {
 	}
 	f.mu.Unlock()
 
-	wrapCall := func(svcMeth string, args any, reply any) bool {
+	wrapCall := func(svcMeth string, args any, reply any, subCtxDone <-chan struct{}) bool {
 		select {
 		case ok := <-f.rpcChan(svcMeth, args, reply):
 			if !ok {
 				return false
 			}
-		case <-f.subCtx.Done():
+		case <-subCtxDone:
 			return false
 		}
 		r := resp{
@@ -204,7 +204,7 @@ func (f *peer) maybeSendAppend() bool {
 		}
 		select {
 		case f.output <- r:
-		case <-f.subCtx.Done():
+		case <-subCtxDone:
 			return false
 		}
 		return true
@@ -213,7 +213,7 @@ func (f *peer) maybeSendAppend() bool {
 	switch m := msg.(type) {
 	case SendLogArgs:
 		reply := SendLogReply{}
-		ok := wrapCall("Raft.ReceiveLog", &m, &reply)
+		ok := wrapCall("Raft.ReceiveLog", &m, &reply, f.subCtx.Done())
 		if ok {
 			if reply.Success {
 				f.mu.Lock()
@@ -228,16 +228,15 @@ func (f *peer) maybeSendAppend() bool {
 		return true
 	case RequestVoteArgs:
 		reply := RequestVoteReply{}
-		ok := wrapCall("Raft.RequestVote", &m, &reply)
+		ok := wrapCall("Raft.RequestVote", &m, &reply, f.subCtx.Done())
 		return ok
 	case HeartBeatArgs:
 		reply := HeartBeatReply{}
-		ok := wrapCall("Raft.ReceiveLog", &m, &reply)
+		ok := wrapCall("Raft.ReceiveHeartBeat", &m, &reply, f.subCtx.Done())
 		if ok && !reply.Success {
 			f.findConflict(m.SendLogArgs, reply.SendLogReply)
 		}
-		// 心跳发送失败，不再尝试
-		return false
+		return true
 	}
 	return false
 }
@@ -245,6 +244,7 @@ func (f *peer) maybeSendAppend() bool {
 func (f *peer) close(ctx context.Context) {
 	<-ctx.Done()
 	close(f.wakeup)
+	f.subCtxCancel()
 	close(f.output)
 }
 
@@ -300,7 +300,7 @@ func (f *peer) sendMsg() {
 		case struct{}:
 			// 探测信号
 		default:
-			f.logger.Panic("一个未知的类型", zap.Any("value", m), zap.String("type", fmt.Sprintf("%T", m)))
+			f.logger.Panic("未知类型", zap.Any("value", m), zap.String("type", fmt.Sprintf("%T", m)))
 		}
 	}
 }

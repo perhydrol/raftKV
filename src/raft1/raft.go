@@ -45,8 +45,8 @@ const (
 )
 
 const (
-	heartBeatTick = 200
-	electionTick  = 600
+	heartBeatTick = 500
+	electionTick  = 1000
 )
 
 type changeState struct {
@@ -69,19 +69,20 @@ func initLogger(me int) *zap.Logger {
 	return l.With(zap.Int("Srv", me))
 }
 
+// 调用时确保持有锁
 func (rf *Raft) logPrintf() *zap.Logger {
 	if false {
 		return zap.NewNop()
 	}
 	states := [...]string{"FOLLOWER", "CANDIDATE", "LEADER"}
 	stateStr := "UNKNOWN"
-	state := StateType(atomic.LoadInt64(&rf.state))
+	state := StateType(rf.state)
 	if int(state) < len(states) {
 		stateStr = states[state]
 	}
 
 	return rf.logger.With(
-		zap.Int64("Term", atomic.LoadInt64(&rf.currentTerm)),
+		zap.Int64("Term", rf.currentTerm),
 		zap.String("State", stateStr),
 		zap.Int("LIDx", rf.log.endIndex()),
 		zap.Int("LTerm", rf.log.endTerm()),
@@ -167,16 +168,20 @@ type Raft struct {
 }
 
 func (rf *Raft) getCurrentTerm() int64 {
-	return atomic.LoadInt64(&rf.currentTerm)
+	rf.mu.RLock()
+	defer rf.mu.RUnlock()
+	return rf.currentTerm
 }
 
 func (rf *Raft) getState() int64 {
-	return atomic.LoadInt64(&rf.state)
+	rf.mu.RLock()
+	defer rf.mu.RUnlock()
+	return rf.state
 }
 
 // raft 内部函数，调用时必须持有写锁
 func (rf *Raft) updateTerm(term int) {
-	atomic.StoreInt64(&rf.currentTerm, int64(term))
+	rf.currentTerm = int64(term)
 	rf.votedFor = -1 // 任期变了，选票需要重置
 	rf.getVoteCount = 0
 }
@@ -186,7 +191,7 @@ func (rf *Raft) updateTerm(term int) {
 func (rf *Raft) GetState() (int, bool) {
 	rf.mu.RLock()
 	defer rf.mu.RUnlock()
-	return int(atomic.LoadInt64(&rf.currentTerm)), StateType(atomic.LoadInt64(&rf.state)) == isLeader
+	return int(rf.currentTerm), StateType(rf.state) == isLeader
 }
 
 // save Raft's persistent state to stable storage,
@@ -242,11 +247,11 @@ func (rf *Raft) getRaftCoreStatus() coreStatus {
 	rf.mu.RLock()
 	defer rf.mu.RUnlock()
 	cs := coreStatus{
-		currentTerm: int(atomic.LoadInt64(&rf.currentTerm)),
+		currentTerm: int(rf.currentTerm),
 		votedFor:    rf.votedFor,
 		commitIndex: rf.log.getCommitIndex(),
 		lastApplied: rf.lastApplied,
-		state:       StateType(atomic.LoadInt64(&rf.state)),
+		state:       StateType(rf.state),
 		me:          rf.me,
 	}
 	return cs
@@ -291,8 +296,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	defer rf.mu.Unlock()
 	rf.logPrintf().Debug("接收新的投票信号", zap.Int("CandidateID", args.CandidateID))
 
-	currentTerm := int(atomic.LoadInt64(&rf.currentTerm))
-	state := StateType(atomic.LoadInt64(&rf.state))
+	currentTerm := int(rf.currentTerm)
+	state := StateType(rf.state)
 
 	var cs *changeState //如果投票请求导致节点状态变化，需要通知follower管理器
 	defer func() {
@@ -320,7 +325,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 				to:   isFollower,
 				term: args.Term,
 			}
-			atomic.StoreInt64(&rf.state, int64(isFollower))
+			rf.state = int64(isFollower)
 		}
 		rf.persist()                       // 状态改变，必须持久化
 		rf.ticker.newOutTime(electionTick) // 即便不投票，当集群存在较新的term时也需要重置记时器
@@ -346,7 +351,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 				to:   isFollower,
 				term: args.Term,
 			}
-			atomic.StoreInt64(&rf.state, int64(isFollower))
+			rf.state = int64(isFollower)
 		}
 		rf.persist() // 先持久化，再回复！
 
@@ -354,6 +359,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 		reply.VoteGranted = true
 		rf.logPrintf().Info("投票成功", zap.Int("Candidate", args.CandidateID), zap.Int("Term", args.Term))
+		return
 	}
 	rf.logPrintf().Debug("拒绝投票", zap.Int("CandidateID", args.CandidateID))
 }
@@ -381,13 +387,68 @@ type HeartBeatReply struct {
 	SendLogReply
 }
 
+func (rf *Raft) ReceiveHeartBeat(args *HeartBeatArgs, reply *HeartBeatReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.logPrintf().Debug("接收心跳信号", zap.Int("leaderID", args.LeaderID), zap.Int("heartBeatTerm", args.Term))
+
+	currentTerm := int(rf.currentTerm)
+	state := StateType(rf.state)
+
+	var cs *changeState
+	defer func() {
+		if cs != nil {
+			rf.sendToFollowers <- *cs
+		}
+	}()
+	reply.NodeID = rf.me
+
+	if args.Term < currentTerm {
+		reply.Success = false
+		reply.Term = currentTerm
+		return
+	}
+
+	rf.logPrintf().Debug("确认心跳Term有效", zap.Int("leaderID", args.LeaderID))
+	rf.ticker.newOutTime(electionTick) // 无论如何，只要term有效就重置记时器
+
+	if args.Term > currentTerm {
+		rf.updateTerm(args.Term)
+		if state != isFollower {
+			cs = &changeState{
+				from: state,
+				to:   isFollower,
+				term: args.Term,
+			}
+			rf.state = int64(isFollower)
+		}
+		rf.persist() // 状态改变，必须持久化
+	}
+	reply.Term = args.Term
+
+	prevLog, err := rf.log.get(args.PrevLogIndex)
+	if err != nil {
+		rf.logPrintf().Warn("无法获取prevLog", zap.Int("prevLogIndex", args.PrevLogIndex), zap.Error(err))
+		reply.Success = false
+		return
+	}
+	if prevLog.Index == args.PrevLogIndex && prevLog.Term == args.PrevLogTerm {
+		reply.Index = args.Entries.Index
+		reply.Success = true
+		rf.log.setCommit(args.LeaderCommit)
+		rf.persist()
+		return
+	}
+	reply.Success = false
+}
+
 func (rf *Raft) ReceiveLog(args *SendLogArgs, reply *SendLogReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	rf.logPrintf().Debug("接收新的日志同步信号")
 
-	currentTerm := int(atomic.LoadInt64(&rf.currentTerm))
-	state := StateType(atomic.LoadInt64(&rf.state))
+	currentTerm := int(rf.currentTerm)
+	state := StateType(rf.state)
 
 	var cs *changeState
 	defer func() {
@@ -413,7 +474,7 @@ func (rf *Raft) ReceiveLog(args *SendLogArgs, reply *SendLogReply) {
 				to:   isFollower,
 				term: args.Term,
 			}
-			atomic.StoreInt64(&rf.state, int64(isFollower))
+			rf.state = int64(isFollower)
 		}
 		rf.persist() // 状态改变，必须持久化
 	}
@@ -471,8 +532,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 func (rf *Raft) tickOutTime() {
 	rf.mu.RLock()
-	state := StateType(atomic.LoadInt64(&rf.state))
-	currentTerm := int(atomic.LoadInt64(&rf.currentTerm))
+	state := StateType(rf.state)
+	currentTerm := int(rf.currentTerm)
 	switch state {
 	case isLeader:
 		msg := HeartBeatArgs{
@@ -519,9 +580,9 @@ func (rf *Raft) killed() bool {
 func (rf *Raft) election() {
 	rf.mu.Lock()
 	rf.votedFor = rf.me
-	currentTerm := int(atomic.LoadInt64(&rf.currentTerm))
+	currentTerm := int(rf.currentTerm)
 	newTerm := currentTerm + 1
-	atomic.StoreInt64(&rf.currentTerm, int64(newTerm))
+	rf.currentTerm = int64(newTerm)
 	rf.getVoteCount = 1
 	requestVote := RequestVoteArgs{
 		Term:         newTerm,
@@ -529,13 +590,13 @@ func (rf *Raft) election() {
 		LastLogIndex: rf.log.endIndex(),
 		LastLogTerm:  rf.log.endTerm(),
 	}
-	state := StateType(atomic.LoadInt64(&rf.state))
+	state := StateType(rf.state)
 	rf.sendToFollowers <- changeState{
 		from: state,
 		to:   isCandidate,
 		term: newTerm,
 	}
-	atomic.StoreInt64(&rf.state, int64(isCandidate))
+	rf.state = int64(isCandidate)
 	rf.logPrintf().Info("开启选举")
 	rf.mu.Unlock()
 	rf.sendToFollowers <- requestVote
@@ -543,43 +604,28 @@ func (rf *Raft) election() {
 
 func (rf *Raft) processVoteReply(m RequestVoteReply) {
 	rf.mu.Lock()
-	state := StateType(atomic.LoadInt64(&rf.state))
-	currentTerm := int(atomic.LoadInt64(&rf.currentTerm))
+	state := StateType(rf.state)
+	currentTerm := int(rf.currentTerm)
 	if state == isCandidate && m.Term == currentTerm {
 		if m.VoteGranted {
 			rf.getVoteCount++
 			if rf.getVoteCount > len(rf.peers)/2 {
 				rf.logPrintf().Info("成为领导者节点")
-				atomic.StoreInt64(&rf.state, int64(isLeader))
+				rf.state = int64(isLeader)
 				rf.sendToFollowers <- changeState{
 					from: isCandidate,
 					to:   isLeader,
 					term: currentTerm,
 				}
 				rf.ticker.newOutTime(heartBeatTick)
-				entity := rf.log.newLog(nil, currentTerm)
-				prevLogIndex := entity.Index - 1
-				prevLogTerm, err := rf.log.getTerm(entity.Index - 1)
-				if err != nil {
-					rf.logPrintf().Error("获取term错误", zap.Int("index", prevLogIndex), zap.Error(err))
-					panic(err)
-				}
-				msg := SendLogArgs{
-					Term:         currentTerm,
-					LeaderID:     rf.me,
-					PrevLogIndex: prevLogIndex,
-					PrevLogTerm:  prevLogTerm,
-					LeaderCommit: rf.log.getCommitIndex(),
-					Entries:      entity,
-				}
-				rf.sendToFollowers <- msg
+				rf.log.newLog(nil, currentTerm)
+				rf.sendToFollowers <- newLog{}
 				rf.logPrintf().Debug("领导者发送一个空日志")
-
 			}
 		} else {
 			if m.Term > currentTerm {
 				rf.updateTerm(m.Term)
-				atomic.StoreInt64(&rf.state, int64(isFollower))
+				rf.state = int64(isFollower)
 				rf.sendToFollowers <- changeState{
 					from: isCandidate,
 					to:   isFollower,
@@ -597,8 +643,8 @@ func (rf *Raft) processReply(m SendLogReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	currentTerm := int(atomic.LoadInt64(&rf.currentTerm))
-	state := StateType(atomic.LoadInt64(&rf.state))
+	currentTerm := int(rf.currentTerm)
+	state := StateType(rf.state)
 
 	if m.Term < currentTerm {
 		return
@@ -610,7 +656,7 @@ func (rf *Raft) processReply(m SendLogReply) {
 			to:   isFollower,
 			term: m.Term,
 		}
-		atomic.StoreInt64(&rf.state, int64(isFollower))
+		rf.state = int64(isFollower)
 		rf.persist() // 状态改变，必须持久化
 		rf.ticker.newOutTime(electionTick)
 		return
@@ -631,9 +677,10 @@ func (rf *Raft) run() {
 				rf.processVoteReply(*m)
 			case *SendLogReply:
 				rf.processReply(*m)
-			case *HeartBeatArgs:
+			case *HeartBeatReply:
+				// TODO 或许可以检查peer的返回情况，过半失联时自动退回follower
 			default:
-				rf.logger.Panic("未知类型")
+				rf.logger.Panic("未知类型", zap.Any("value", m), zap.String("type", fmt.Sprintf("%T", m)))
 			}
 		case <-rf.ctx.Done():
 			rf.logger.Info("主线程退出")
