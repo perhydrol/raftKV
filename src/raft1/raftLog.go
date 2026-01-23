@@ -75,6 +75,8 @@ func newRaftLog(ctx context.Context, peerLen int, applyCh chan raftapi.ApplyMsg,
 
 func (rl *raftLog) close() {
 	<-rl.ctx.Done()
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
 	close(rl.applyCh)
 	close(rl.selfCh)
 }
@@ -133,21 +135,24 @@ func (rl *raftLog) getSlice(begin, end int) ([]Entry, error) {
 	defer func() {
 		rl.logger.Debug("退出getSlice")
 	}()
-	if begin < rl.offset {
-		begin = rl.offset
+	if begin < rl.logData[0].Index {
+		rl.logger.Warn("begin过小，可能已被快照覆盖", zap.Int("offset", rl.offset))
+		begin = rl.logData[0].Index
 	}
-	if end >= rl.offset+len(rl.logData) {
-		end = rl.offset + len(rl.logData) - 1
+	if end > rl.logData[len(rl.logData)-1].Index {
+		rl.logger.Warn("end过大，已减小", zap.Int("offset", rl.offset), zap.Int("len(rl.logData)", len(rl.logData)))
+		end = rl.logData[len(rl.logData)-1].Index
 	}
 
 	if begin > end {
-		return []Entry{}, fmt.Errorf("日志范围错误（begin应该小于等于end）")
+		return []Entry{}, fmt.Errorf("日志范围错误（begin应该小于等于end，begin: %d end: %d）", begin, end)
 	}
 
 	startIdx := begin - rl.offset
 	endIdx := end - rl.offset
 
 	if startIdx < 0 || endIdx >= len(rl.logData) || startIdx > endIdx {
+		rl.logger.Warn("获取日志slice的切片范围无效，已返回空日志", zap.Int("startIdx", startIdx), zap.Int("endIdx", endIdx))
 		return []Entry{}, nil
 	}
 

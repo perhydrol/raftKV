@@ -278,7 +278,7 @@ func (f *peer) sendMsg() {
 			f.mu.Lock()
 			f.logger.Debug(
 				"peer接收到节点状态改变",
-				zap.Int("followTerm", int(f.getCurrentTerm())),
+				zap.Int("peerTerm", int(f.getCurrentTerm())),
 				zap.Int("msgTerm", m.term),
 				zap.String("from", states[m.from]),
 				zap.String("to", states[m.to]),
