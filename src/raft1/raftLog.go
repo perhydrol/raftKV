@@ -137,7 +137,7 @@ func (rl *raftLog) getSlice(begin, end int) ([]Entry, error) {
 	}()
 	if begin < rl.logData[0].Index {
 		rl.logger.Warn("begin过小，可能已被快照覆盖", zap.Int("offset", rl.offset))
-		begin = rl.logData[0].Index
+		begin = rl.logData[1].Index
 	}
 	if end > rl.logData[len(rl.logData)-1].Index {
 		rl.logger.Warn("end过大，已减小", zap.Int("offset", rl.offset), zap.Int("len(rl.logData)", len(rl.logData)))

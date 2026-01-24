@@ -23,6 +23,7 @@ import (
 	"6.5840/labrpc"
 	"6.5840/raftapi"
 	tester "6.5840/tester1"
+	"github.com/petermattis/goid"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
@@ -66,7 +67,7 @@ func initLogger(me int) *zap.Logger {
 	if err != nil {
 		panic(err)
 	}
-	return l.With(zap.Int("Srv", me))
+	return l.With(zap.Int("Srv", me), zap.Int64("gid", goid.Get()))
 }
 
 // 调用时确保持有锁
