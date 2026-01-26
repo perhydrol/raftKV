@@ -165,6 +165,9 @@ type Raft struct {
 	// 用于接受所有follower的返回信号
 	followerResp <-chan resp
 
+	// 本次心跳响应计数，用于leader感知自己是否被分区
+	heartBeatSuccessCount atomic.Int32
+
 	ticker ticker
 }
 
@@ -184,6 +187,7 @@ func (rf *Raft) getState() int64 {
 func (rf *Raft) updateTerm(term int) {
 	rf.currentTerm = int64(term)
 	rf.votedFor = -1 // 任期变了，选票需要重置
+	rf.heartBeatSuccessCount.Store(0)
 	rf.getVoteCount = 0
 }
 
@@ -536,6 +540,43 @@ func (rf *Raft) Start(command any) (int, int, bool) {
 	return index, term, isLeader
 }
 
+func (rf *Raft) testHearBeat(beginTerm int64) {
+	var cs *changeState
+	defer func() {
+		if cs != nil {
+			rf.sendToFollowers <- *cs
+		}
+	}()
+	ticker := time.NewTicker((electionTick + 800) * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		<-ticker.C
+		rf.mu.RLock()
+		if rf.currentTerm != beginTerm {
+			rf.mu.RLocker()
+			return
+		}
+		rf.mu.RUnlock()
+		if rf.heartBeatSuccessCount.Load() < int32(len(rf.peers)/2) {
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+			newTerm := int(rf.currentTerm) + 1
+			if rf.state != int64(isFollower) {
+				rf.updateTerm(newTerm)
+				cs = &changeState{
+					from: StateType(rf.state),
+					to:   isFollower,
+					term: newTerm,
+				}
+				rf.state = int64(isFollower)
+				rf.persist() // 状态改变，必须持久化
+				rf.logPrintf().Info("心跳长期无响应，退回follower")
+			}
+			return
+		}
+	}
+}
+
 func (rf *Raft) tickOutTime() {
 	rf.mu.RLock()
 	state := StateType(rf.state)
@@ -553,6 +594,7 @@ func (rf *Raft) tickOutTime() {
 			},
 		}
 		rf.logPrintf().Info("发送心跳")
+		go rf.testHearBeat(rf.currentTerm)
 		rf.mu.RUnlock()
 		rf.sendToFollowers <- msg
 		rf.ticker.reset()
@@ -672,6 +714,33 @@ func (rf *Raft) processReply(m SendLogReply) {
 	rf.persist()
 }
 
+func (rf *Raft) processHeartBeatReply(m HeartBeatReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	var cs *changeState
+	defer func() {
+		if cs != nil {
+			rf.sendToFollowers <- *cs
+		}
+	}()
+	if m.Term != int(rf.currentTerm) {
+		if m.Term > int(rf.currentTerm) && rf.state != int64(isFollower) {
+			rf.updateTerm(m.Term)
+			cs = &changeState{
+				from: StateType(rf.state),
+				to:   isFollower,
+				term: m.Term,
+			}
+			rf.state = int64(isFollower)
+			rf.persist() // 状态改变，必须持久化
+		}
+		return
+	}
+	if m.Success {
+		rf.heartBeatSuccessCount.Add(1)
+	}
+}
+
 func (rf *Raft) run() {
 	for {
 		select {
@@ -684,7 +753,7 @@ func (rf *Raft) run() {
 			case *SendLogReply:
 				rf.processReply(*m)
 			case *HeartBeatReply:
-				// TODO 或许可以检查peer的返回情况，过半失联时自动退回follower
+				rf.processHeartBeatReply(*m)
 			default:
 				rf.logger.Panic("未知类型", zap.Any("value", m), zap.String("type", fmt.Sprintf("%T", m)))
 			}

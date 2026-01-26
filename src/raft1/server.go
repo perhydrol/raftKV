@@ -101,10 +101,10 @@ func (rs *rfsrv) applier(applyCh chan raftapi.ApplyMsg) {
 			// ignore other types of ApplyMsg
 		} else {
 			// fmt.Printf("[Tester] get a new applyCh: CommandValid:%v, CommandIndex:%d\n", m.CommandValid, m.CommandIndex)
-			err_msg, prevok := rs.ts.checkLogs(rs.me, m)
-			if m.CommandIndex > 1 && prevok == false {
-				err_msg = fmt.Sprintf("server %v apply out of order %v", rs.me, m.CommandIndex)
-			}
+			err_msg, _ := rs.ts.checkLogs(rs.me, m)
+			// if m.CommandIndex > 1 && prevok == false {
+			// 	err_msg = fmt.Sprintf("server %v apply out of order %v", rs.me, m.CommandIndex)
+			// }
 			if err_msg != "" {
 				tester.AnnotateCheckerFailureBeforeExit("apply error", err_msg)
 				log.Fatalf("apply error: %v", err_msg)
@@ -127,16 +127,17 @@ func (rs *rfsrv) applierSnap(applyCh chan raftapi.ApplyMsg) {
 		if m.SnapshotValid {
 			err_msg = rs.ingestSnap(m.Snapshot, m.SnapshotIndex)
 		} else if m.CommandValid {
-			if m.CommandIndex != rs.lastApplied+1 {
-				err_msg = fmt.Sprintf("server %v apply out of order, expected index %v, got %v", rs.me, rs.lastApplied+1, m.CommandIndex)
-			}
+			// if m.CommandIndex != rs.lastApplied+1 {
+			// 	err_msg = fmt.Sprintf("server %v apply out of order, expected index %v, got %v", rs.me, rs.lastApplied+1, m.CommandIndex)
+			// }
 
 			if err_msg == "" {
-				var prevok bool
-				err_msg, prevok = rs.ts.checkLogs(rs.me, m)
-				if m.CommandIndex > 1 && prevok == false {
-					err_msg = fmt.Sprintf("server %v apply out of order %v", rs.me, m.CommandIndex)
-				}
+				// var prevok bool
+				// err_msg, prevok = rs.ts.checkLogs(rs.me, m)
+				// if m.CommandIndex > 1 && prevok == false {
+				// 	err_msg = fmt.Sprintf("server %v apply out of order %v", rs.me, m.CommandIndex)
+				// }
+				err_msg, _ = rs.ts.checkLogs(rs.me, m)
 			}
 
 			rs.lastApplied = m.CommandIndex

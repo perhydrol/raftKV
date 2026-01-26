@@ -100,9 +100,9 @@ func (rl *raftLog) installSnapshot(index int, term int, snapshot []byte) bool {
 
 // 获取指定index log的任期
 func (rl *raftLog) getTerm(i int) (int, error) {
-	rl.logger.Debug("进入getTerm")
+	// rl.logger.Debug("进入getTerm")
 	defer func() {
-		rl.logger.Debug("退出getTerm")
+		// rl.logger.Debug("退出getTerm")
 	}()
 	rl.mu.RLock()
 	defer rl.mu.RUnlock()
@@ -115,9 +115,9 @@ func (rl *raftLog) getTerm(i int) (int, error) {
 }
 
 func (rl *raftLog) get(i int) (Entry, error) {
-	rl.logger.Debug("进入get")
+	// rl.logger.Debug("进入get")
 	defer func() {
-		rl.logger.Debug("退出get")
+		// rl.logger.Debug("退出get")
 	}()
 	rl.mu.RLock()
 	defer rl.mu.RUnlock()
@@ -131,9 +131,9 @@ func (rl *raftLog) get(i int) (Entry, error) {
 // 注意：是闭区间
 // 仅限raftLog自行调用，使用时需要确保持有rl读锁
 func (rl *raftLog) getSlice(begin, end int) ([]Entry, error) {
-	rl.logger.Debug("进入getSlice")
+	// rl.logger.Debug("进入getSlice")
 	defer func() {
-		rl.logger.Debug("退出getSlice")
+		// rl.logger.Debug("退出getSlice")
 	}()
 	if begin < rl.logData[0].Index {
 		rl.logger.Warn("begin过小，可能已被快照覆盖", zap.Int("offset", rl.offset))
@@ -163,9 +163,9 @@ func (rl *raftLog) getSlice(begin, end int) ([]Entry, error) {
 }
 
 func (rl *raftLog) newLog(command *any, term int) Entry {
-	rl.logger.Debug("进入newLog")
+	// rl.logger.Debug("进入newLog")
 	defer func() {
-		rl.logger.Debug("退出newLog")
+		// rl.logger.Debug("退出newLog")
 	}()
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
@@ -179,9 +179,9 @@ func (rl *raftLog) newLog(command *any, term int) Entry {
 }
 
 func (rl *raftLog) append(ents ...Entry) {
-	rl.logger.Debug("进入append")
+	// rl.logger.Debug("进入append")
 	defer func() {
-		rl.logger.Debug("退出append")
+		// rl.logger.Debug("退出append")
 	}()
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
@@ -202,9 +202,9 @@ func (rl *raftLog) append(ents ...Entry) {
 // 需要保证传入的 resp 是本任期的响应，以实现间接提交。函数内部不再检查term
 func (rl *raftLog) logAccept(resp SendLogReply) {
 	// TODO 也许可以实现一个logRespCount缩容操作
-	rl.logger.Debug("进入logAccept")
+	// rl.logger.Debug("进入logAccept")
 	defer func() {
-		rl.logger.Debug("退出logAccept")
+		// rl.logger.Debug("退出logAccept")
 	}()
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
@@ -222,9 +222,9 @@ func (rl *raftLog) logAccept(resp SendLogReply) {
 }
 
 func (rl *raftLog) setCommit(commit int) {
-	rl.logger.Debug("进入setCommit")
+	// rl.logger.Debug("进入setCommit")
 	defer func() {
-		rl.logger.Debug("退出setCommit")
+		// rl.logger.Debug("退出setCommit")
 	}()
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
@@ -288,9 +288,9 @@ func (rl *raftLog) apply() {
 }
 
 func (rl *raftLog) getCommitIndex() int {
-	rl.logger.Debug("进入getCommitIndex")
+	// rl.logger.Debug("进入getCommitIndex")
 	defer func() {
-		rl.logger.Debug("退出getCommitIndex")
+		// rl.logger.Debug("退出getCommitIndex")
 	}()
 	rl.mu.RLock()
 	defer rl.mu.RUnlock()
@@ -298,9 +298,9 @@ func (rl *raftLog) getCommitIndex() int {
 }
 
 func (rl *raftLog) endIndex() int {
-	rl.logger.Debug("进入endIndex")
+	// rl.logger.Debug("进入endIndex")
 	defer func() {
-		rl.logger.Debug("退出endIndex")
+		// rl.logger.Debug("退出endIndex")
 	}()
 	rl.mu.RLock()
 	defer rl.mu.RUnlock()
@@ -308,9 +308,9 @@ func (rl *raftLog) endIndex() int {
 }
 
 func (rl *raftLog) endTerm() int {
-	rl.logger.Debug("进入endTerm")
+	// rl.logger.Debug("进入endTerm")
 	defer func() {
-		rl.logger.Debug("退出endTerm")
+		// rl.logger.Debug("退出endTerm")
 	}()
 	rl.mu.RLock()
 	defer rl.mu.RUnlock()

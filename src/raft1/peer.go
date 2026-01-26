@@ -127,6 +127,10 @@ func (f *peer) rpcChan(svcMeth string, args any, reply any) <-chan bool {
 func (f *peer) send() {
 	for range f.wakeup {
 		for f.maybeSendAppend() {
+			select {
+			case <-f.ctx.Done():
+			default:
+			}
 		}
 	}
 }
