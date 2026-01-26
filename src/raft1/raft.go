@@ -521,13 +521,18 @@ func (rf *Raft) ReceiveLog(args *SendLogArgs, reply *SendLogReply) {
 // if it's ever committed. the second return value is the current
 // term. the third return value is true if this server believes it is
 // the leader.
-func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
-	// Your code here (3B).
-
+func (rf *Raft) Start(command any) (int, int, bool) {
+	rf.mu.RLock()
+	defer rf.mu.RUnlock()
+	if rf.state != int64(isLeader) || rf.killed() {
+		return -1, -1, false
+	}
+	rf.log.newLog(&command, int(rf.currentTerm))
+	index := rf.log.endIndex()
+	term := rf.log.endTerm()
+	isLeader := rf.state == int64(isLeader)
+	rf.sendToFollowers <- newLog{}
+	rf.logPrintf().Info("外部传入新的日志", zap.Int("index", index))
 	return index, term, isLeader
 }
 

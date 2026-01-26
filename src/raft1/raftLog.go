@@ -259,6 +259,7 @@ func (rl *raftLog) apply() {
 
 			for i := range e {
 				if e[i].Command == nil {
+					rl.logger.Debug("应用时跳过空日志", zap.Int("index", e[i].Index))
 					continue
 				}
 				select {
@@ -270,6 +271,7 @@ func (rl *raftLog) apply() {
 					CommandIndex:  e[i].Index,
 					SnapshotValid: false,
 				}:
+					rl.logger.Debug("成功应用日志", zap.Int("index", e[i].Index))
 				}
 			}
 
