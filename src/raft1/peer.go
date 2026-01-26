@@ -127,10 +127,6 @@ func (f *peer) rpcChan(svcMeth string, args any, reply any) <-chan bool {
 func (f *peer) send() {
 	for range f.wakeup {
 		for f.maybeSendAppend() {
-			select {
-			case <-f.ctx.Done():
-			default:
-			}
 		}
 	}
 }
@@ -143,11 +139,18 @@ func (f *peer) findConflict(arg SendLogArgs, reply SendLogReply) {
 	if reply.Term == int(f.getCurrentTerm()) {
 		// TODO 需要实现快速回退逻辑
 		f.nextIndex = arg.PrevLogIndex - 1
+		f.logger.Info("回退", zap.Int("nextIndex", f.nextIndex))
 	}
 }
 
 // 尝试排空待发送队列，返回 true 表明成功取得数据并发送，返回 false 表示队列为空
 func (f *peer) maybeSendAppend() bool {
+	select {
+	case <-f.ctx.Done():
+		f.logger.Debug("raft core主循环退出，peer.maybeSendAppend退出")
+		return false
+	default:
+	}
 	var msg any
 	f.mu.Lock()
 	if StateType(f.getState()) == isFollower {

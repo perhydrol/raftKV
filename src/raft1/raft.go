@@ -570,7 +570,7 @@ func (rf *Raft) testHearBeat(beginTerm int64) {
 				}
 				rf.state = int64(isFollower)
 				rf.persist() // 状态改变，必须持久化
-				rf.logPrintf().Info("心跳长期无响应，退回follower")
+				rf.logPrintf().Warn("心跳长期无响应，退回follower")
 			}
 			return
 		}

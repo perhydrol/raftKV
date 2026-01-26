@@ -210,7 +210,8 @@ func (rl *raftLog) logAccept(resp SendLogReply) {
 	defer rl.mu.Unlock()
 	if resp.Index > int(rl.committed) {
 		rl.logRespCount[resp.Index]++
-		if rl.logRespCount[resp.Index] > rl.peerLen/2 {
+		// leader自身需要+1
+		if rl.logRespCount[resp.Index]+1 > rl.peerLen/2 {
 			rl.committed = resp.Index
 			rl.logger.Info("提交log数据", zap.Int("commitIndex", resp.Index))
 			select {
@@ -254,8 +255,8 @@ func (rl *raftLog) apply() {
 			if err != nil {
 				rl.logger.Panic("获取log失败", zap.Int("beginIndex", rl.applied+1), zap.Int("endIndex", rl.committed), zap.Error(err))
 			}
-			commited := rl.committed
 			rl.mu.RUnlock()
+			commited := 0
 
 			for i := range e {
 				if e[i].Command == nil {
@@ -272,6 +273,7 @@ func (rl *raftLog) apply() {
 					SnapshotValid: false,
 				}:
 					rl.logger.Debug("成功应用日志", zap.Int("index", e[i].Index))
+					commited = e[i].Index
 				}
 			}
 
