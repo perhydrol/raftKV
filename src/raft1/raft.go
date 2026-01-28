@@ -7,7 +7,7 @@ package raft
 // Make() creates a new raft peer that implements the raft interface.
 
 import (
-	//	"bytes"
+	"bytes"
 	"context"
 	"fmt"
 	"math/rand"
@@ -17,9 +17,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	//	"6.5840/labgob"
 	_ "net/http/pprof"
 
+	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
 	tester "6.5840/tester1"
@@ -207,14 +207,22 @@ func (rf *Raft) GetState() (int, bool) {
 // after you've implemented snapshots, pass the current snapshot
 // (or nil if there's not yet a snapshot).
 func (rf *Raft) persist() {
-	// Your code here (3C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	if err := e.Encode(rf.currentTerm); err != nil {
+		rf.logger.Error("persist encode currentTerm error", zap.Error(err))
+	}
+	if err := e.Encode(rf.votedFor); err != nil {
+		rf.logger.Error("persist encode votedFor error", zap.Error(err))
+	}
+	if err := e.Encode(rf.log.logData); err != nil {
+		rf.logger.Error("persist encode logData error", zap.Error(err))
+	}
+	if err := e.Encode(rf.log.offset); err != nil {
+		rf.logger.Error("persist encode offset error", zap.Error(err))
+	}
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 // restore previously persisted state.
@@ -222,19 +230,27 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	// Your code here (3C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int64
+	var votedFor int
+	var logData []Entry
+	var offset int
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&logData) != nil ||
+		d.Decode(&offset) != nil {
+		rf.logger.Error("readPersist decode error")
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		if rf.log != nil {
+			rf.log.mu.Lock()
+			rf.log.logData = logData
+			rf.log.offset = offset
+			rf.log.mu.Unlock()
+		}
+	}
 }
 
 type coreStatus struct {
